@@ -19,7 +19,6 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fPIC")
 set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -DPIC")
 set(CMAKE_ASM_FLAGS "-x assembler-with-cpp")
 
-
 set(ANDROID_MODE OFF)
 if (${ANDROID_MODE})
     set(ANDROID ON)
@@ -163,18 +162,6 @@ endif()
 
 target_compile_definitions(tefkernel PUBLIC IS_TEFKERNEL_BUILD)
 
-add_subdirectory(libffi)
-
-target_link_libraries(tefkernel
-        PRIVATE
-        libffi
-)
-
-target_include_directories(tefkernel PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/libffi/include
-        ${CMAKE_CURRENT_BINARY_DIR}/libffi/include
-)
-
 if (${ANDROID})
     # set(Plugin.SymbolResolver OFF CACHE BOOL "Enable symbol resolver" FORCE)
 
@@ -187,15 +174,23 @@ if (${ANDROID})
     set(FullFloatingPointRegisterPack OFF CACHE BOOL "Save and pack all floating-point registers" FORCE)
     set(DOBBY_DEBUG OFF CACHE BOOL "Enable debug logging" FORCE) # 生产环境建议关闭
 
-    add_subdirectory(xdl)
-    add_subdirectory(dobby)
+    add_subdirectory(libs/libffi)
+    add_subdirectory(libs/xdl)
+    add_subdirectory(libs/dobby)
     target_link_libraries(tefkernel
             PUBLIC
             android
             log
             dobby_static
             xdl
+            libffi
     )
+
+    target_include_directories(tefkernel PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/libs/libffi/include
+            ${CMAKE_CURRENT_BINARY_DIR}/libs/libffi/include
+    )
+
     target_link_options(tefkernel PRIVATE -static-libstdc++)
 endif ()
 

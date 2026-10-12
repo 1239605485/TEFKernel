@@ -346,7 +346,7 @@ patch_handle_t patchlib_array_resize(patch_handle_t src, const size_t nsize, voi
         memcpy(dest_data, src_data, copy_bytes);
     }
 
-    TEKLOG_INFO("resize_array: ✅ Array resized from %u to %zu (element_size=%d)",
+    TEKLOG_DEBUG("resize_array: ✅ Array resized from %u to %zu (element_size=%d)",
                 osize, nsize, element_size);
 
     return narray;

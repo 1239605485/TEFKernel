@@ -980,9 +980,6 @@ void tpf_init_libtefkernel() {
     TPF_KERNEL_SYMBOL(patchlib_method_is_static);
     TPF_KERNEL_SYMBOL(patchlib_method_make_generic_instance);
     TPF_KERNEL_SYMBOL(patchlib_method_invoke_args);
-#if __ANDROID__
-    TPF_KERNEL_SYMBOL(patchlib_method_invoke_value_args);
-#endif
     TPF_KERNEL_SYMBOL(patchlib_constructor_invoke);
     TPF_KERNEL_SYMBOL(patchlib_method_get_token);
     TPF_KERNEL_SYMBOL(patchlib_method_get_signature);
@@ -1056,6 +1053,7 @@ void tpf_init_libtefkernel() {
     // Main
     TPF_KERNEL_SYMBOL(terraria_main_get_cur_release);
     TPF_KERNEL_SYMBOL(terraria_main_get_graphics_device);
+    TPF_KERNEL_SYMBOL(terraria_main_get_local_player);
 
     // Texture2d
     TPF_KERNEL_SYMBOL(terraria_texture2d_create);

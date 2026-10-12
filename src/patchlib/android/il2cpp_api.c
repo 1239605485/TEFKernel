@@ -57,6 +57,7 @@ void il2cpp_api_init(void *handle) {
     LOAD_SYMBOL(il2cpp_class_get_property_from_name);
     LOAD_SYMBOL(il2cpp_class_get_method_from_name);
     LOAD_SYMBOL(il2cpp_class_from_il2cpp_type);
+    LOAD_SYMBOL(il2cpp_class_value_size);
 
     // 加载对象相关API
     LOAD_SYMBOL(il2cpp_object_new);

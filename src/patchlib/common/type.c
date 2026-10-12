@@ -184,7 +184,7 @@ patch_handle_t patchlib_type_get_type(const char *ns, const char *name) {
 
     for (size_t i = 0; i < assemblies_count; ++i) {
         void *assembly = assemblies[i];
-        void *image = il2cpp_assembly_get_image(assembly); //获取image
+        const void *image = il2cpp_assembly_get_image(assembly); //获取image
 
         if (!image) {
             TEKLOG_DEBUG("Assembly %zu has no image", i);
@@ -198,7 +198,7 @@ patch_handle_t patchlib_type_get_type(const char *ns, const char *name) {
 #if !defined(__ANDROID__)
             free(assemblies);
 #endif
-            TEKLOG_INFO("Found type: %s.%s at %p", ns, name, found_class);
+            TEKLOG_DEBUG("Found type: %s.%s at %p", ns, name, found_class);
             return found_class;
         }
     }

@@ -44,6 +44,9 @@ typedef struct patchlib_hook_handle_t {
     tefstd_vector_t prefixes; ///< 前置补丁函数(void*)
     tefstd_vector_t postfixes; ///< 后置补丁函数(void*)
     bool is_hooked; ///< 是否已挂钩
+    ffi_type** arg_types;        // ← 新增，保存 arg_types 数组
+    size_t arg_types_count;      // ← 新增，数组长度
+    ffi_type* return_ffi_type;   // ← 新增，返回类型 ffi_type
 } patchlib_hook_handle_t;
 
 typedef struct patchlib_hook_node_t {
@@ -284,7 +287,7 @@ static bool create_closure_from_signature(patchlib_hook_handle_t* handle) {
     else
         hook_callback = (void*)hook_dispatcher_static;
 
-    ffi_type* re_type = patch_type_to_ffi_type(handle->method_signature.return_type);
+    ffi_type* re_type = patch_type_to_ffi_type(handle->method_signature.return_type, handle->method_signature.return_type_handle);
 
     const size_t args_count = tefstd_vector_size(&handle->method_signature.arg_types);
     const size_t total_args = args_count + (handle->method_signature.is_instance ? 1 : 0) + (il2cpp_method_is_generic(handle->method) ? 1 : 0);
@@ -302,12 +305,14 @@ static bool create_closure_from_signature(patchlib_hook_handle_t* handle) {
 
     for (size_t i = 0; i < args_count; ++i) {
         patch_type_t* type = tefstd_vector_at(&handle->method_signature.arg_types, i);
+        patch_handle_t* type_handle = tefstd_vector_at(&handle->method_signature.arg_type_handles, i);
+
         if (!type) {
             TEKLOG_ERROR("Failed to get argument type at index %zu", i);
             free(arg_types);
             return false;
         }
-        arg_types[arg_index++] = patch_type_to_ffi_type(*type);
+        arg_types[arg_index++] = patch_type_to_ffi_type(*type, *type_handle);
     }
 
     if (il2cpp_method_is_generic(handle->method)) arg_types[arg_index++] = &ffi_type_pointer;
@@ -341,6 +346,9 @@ static bool create_closure_from_signature(patchlib_hook_handle_t* handle) {
 
     handle->closure = exec_mem;
     handle->trampoline_func = exec_mem;
+    handle->arg_types = arg_types;
+    handle->arg_types_count = total_args;
+    handle->return_ffi_type = re_type;
 
     status = ffi_prep_closure_loc(handle->closure, &handle->cif, hook_callback, handle, handle->trampoline_func);
     if (status != FFI_OK) {
@@ -490,8 +498,27 @@ bool patchlib_uninstall_hook(patch_hook_id_t hook_id) {
             }
         }
 
+        // 释放每个 struct 参数的 ffi_type
+        for (size_t i = 0; i < handle->arg_types_count; i++) {
+            patch_handle_t* h = tefstd_vector_at(&handle->method_signature.arg_type_handles, i);
+            if (handle->arg_types && h) {
+                patch_ffi_type_free(handle->arg_types[i], *h);
+            }
+        }
+
+        // 释放返回类型的 ffi_type
+        if (handle->return_ffi_type) {
+            patch_ffi_type_free(handle->return_ffi_type, handle->method_signature.return_type_handle);
+        }
+
+        // 释放 arg_types 数组本身
+        free(handle->arg_types);
+        handle->arg_types = NULL;
+
+        // 释放签名（应包含 arg_type_handles 等）
+        patchlib_method_signature_free(&handle->method_signature);
+
         // 清理签名资源
-        tefstd_vector_destroy(&handle->method_signature.arg_types);
         tefstd_vector_destroy(&handle->prefixes);
         tefstd_vector_destroy(&handle->postfixes);
         free(handle);

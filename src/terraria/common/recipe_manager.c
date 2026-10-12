@@ -23,7 +23,9 @@
 #include "internal/terraria/recipe_manager.h"
 #include "patchlib/field.h"
 #include "patchlib/method.h"
+#include "patchlib/property.h"
 #include "patchlib/struct/array.h"
+#include "terraria/item_manager.h"
 
 static tefstd_vector_t g_recipe_callback;
 
@@ -49,8 +51,10 @@ static patch_handle_t is_a_material_f = PATCH_NULL;
 static patch_handle_t recipe_f = PATCH_NULL;
 static patch_handle_t available_recipe_f = PATCH_NULL;
 
+static patch_handle_t recipe_cls = PATCH_NULL;
+
 static bool
-create_reverse_wall_recipes_prefix(patch_handle_t this, void **args,
+setup_recipes_prefix(patch_handle_t this, void **args,
                                    const patch_method_signature_t *sig_info,
                                    void *result) {
     for (int i = 0; i < tefstd_vector_size(&g_recipe_callback); ++i) {
@@ -68,15 +72,15 @@ void terraria_recipe_manager_init() {
     tefstd_vector_init(&g_recipe_callback,
                        sizeof(terraria_recipe_manager_addrecipes_t));
 
-    patch_handle_t recipe_cls = patchlib_type_get_type("Terraria", "Recipe");
-    patch_handle_t create_reverse_wall_recipes =
+    recipe_cls = patchlib_type_get_type("Terraria", "Recipe");
+    patch_handle_t setup_recipes =
             patchlib_type_get_method_by_param_count(recipe_cls,
-                                                    "CreateReverseWallRecipes", 0);
+                                                    "SetupRecipes", 0);
 
     set_ingredients =
             patchlib_type_get_method_by_param_count(recipe_cls, "SetIngredients", 1);
     set_crafting_station = patchlib_type_get_method_by_param_count(
-        recipe_cls, "CreateReverseWallRecipes", 0);
+        recipe_cls, "SetCraftingStation", 1);
 
     add_recipe =
             patchlib_type_get_method_by_param_count(recipe_cls, "AddRecipe", 0);
@@ -87,32 +91,28 @@ void terraria_recipe_manager_init() {
     max_recipes_f = patchlib_type_get_field(recipe_cls, "maxRecipes");
     num_recipes_f = patchlib_type_get_field(recipe_cls, "numRecipes");
 
-
     patch_handle_t item_class = patchlib_type_get_type("Terraria", "Item");
     patch_handle_t item_id_cls = patchlib_type_get_type("Terraria.ID", "ItemID");
     patch_handle_t item_id_sets_cls = patchlib_type_get_inner_type(item_id_cls, "Sets");
     is_a_material_f = patchlib_type_get_field(item_id_sets_cls, "IsAMaterial");
 
-
     stack_f = patchlib_type_get_field(item_class, "stack");
     set_defaults =
             patchlib_type_get_method_by_param_count(item_class, "SetDefaults", 2);
 
-    patchlib_install_prepost_hook(create_reverse_wall_recipes,
-                                  create_reverse_wall_recipes_prefix, NULL);
+    patchlib_install_prepost_hook(setup_recipes,
+                                  setup_recipes_prefix, NULL);
 
     patch_handle_t main_cls = patchlib_type_get_type("Terraria", "Main");
     recipe_f = patchlib_type_get_field(main_cls, "recipe");
 #if __ANDROID__
-    available_recipe_f = patchlib_type_get_field(main_cls, "availableRecipeY");
+    available_recipe_f = patchlib_type_get_property(main_cls, "availableRecipe");
 #else
     available_recipe_f = patchlib_type_get_field(main_cls, "availableRecipe");
 #endif
 
     patchlib_free(main_cls);
-    patchlib_free(create_reverse_wall_recipes);
     patchlib_free(item_class);
-    patchlib_free(recipe_cls);
     patchlib_free(item_id_cls);
     patchlib_free(item_id_sets_cls);
 }
@@ -195,29 +195,40 @@ void terraria_recipe_set_station(int tile_id) {
 
 void terraria_recipe_add() {
 
-    int max_recipes = 0;
     int num_recipes = 0;
 
-    patchlib_field_get_value(max_recipes_f, PATCH_NULL, &max_recipes);
     patchlib_field_get_value(num_recipes_f, PATCH_NULL, &num_recipes);
 
-    if (max_recipes != 0 && num_recipes >= max_recipes) {
-        int resize_recipes = 500 + num_recipes;
+    patch_handle_t recipe_array = PATCH_NULL;
+    patchlib_field_get_value(recipe_f, PATCH_NULL, &recipe_array);
+    const int max_recipes = (int)patchlib_array_length(recipe_array);
 
-        patch_handle_t recipe_array = PATCH_NULL;
+    if (max_recipes != 0 && num_recipes >= max_recipes) {
+        int resize_recipes = 5000 + num_recipes;
+
         patch_handle_t available_recipe_array = PATCH_NULL;
         patchlib_field_get_value(recipe_f, PATCH_NULL, &recipe_array);
+#if defined(__ANDROID__)
+        available_recipe_array = ((void*(*)())patchlib_method_get_pointer(patchlib_property_get_get_method(available_recipe_f)))();
+#else
         patchlib_field_get_value(available_recipe_f, PATCH_NULL, &available_recipe_array);
+#endif
+        patch_handle_t new_recipe_obj = patchlib_type_new_instance(recipe_cls);
+        static int zero = 0;
 
-        patch_handle_t new_recipe_array = patchlib_array_resize(recipe_array, resize_recipes, PATCH_NULL);
-        patch_handle_t new_available_recipe_array = patchlib_array_resize(available_recipe_array, resize_recipes, PATCH_NULL);
+        patch_handle_t new_recipe_array = patchlib_array_resize(recipe_array, resize_recipes, &new_recipe_obj);
+        patch_handle_t new_available_recipe_array = patchlib_array_resize(available_recipe_array, resize_recipes, &zero);
+
+        patchlib_free(new_recipe_obj);
 
         patchlib_field_set_value(recipe_f, PATCH_NULL, &new_recipe_array);
-        patchlib_field_set_value(available_recipe_f, PATCH_NULL, &new_available_recipe_array);
-#if !defined(__ANDROID__)
-        patchlib_field_set_value(max_recipes_f, PATCH_NULL, &resize_recipes);
 
-        patchlib_free(recipe_array);
+#if defined(__ANDROID__)
+        ((void(*)(void*))patchlib_method_get_pointer(patchlib_property_get_set_method(available_recipe_f)))(new_available_recipe_array);
+#else
+        patchlib_field_set_value(max_recipes_f, PATCH_NULL, &resize_recipes);
+        patchlib_field_set_value(available_recipe_f, PATCH_NULL, &new_available_recipe_array);
+
         patchlib_free(available_recipe_array);
         patchlib_free(new_recipe_array);
         patchlib_free(new_available_recipe_array);
@@ -225,10 +236,10 @@ void terraria_recipe_add() {
     }
 
 
-
 #if __ANDROID__
     ((void (*)()) patchlib_method_get_pointer(add_recipe))();
 #else
+    patchlib_free(recipe_array);
     patchlib_method_invoke_args(add_recipe, NULL, NULL, NULL);
 #endif
 }
