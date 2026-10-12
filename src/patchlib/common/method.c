@@ -106,7 +106,6 @@ static patch_type_t il2cpp_type_to_patch_type(patch_handle_t type) {
                 break;
             }
 
-
             const char* class_name = il2cpp_class_get_name(kclass);
             const char* namespace_name = il2cpp_class_get_namespace(kclass);
             patchlib_free(kclass);
@@ -167,15 +166,19 @@ static patch_type_t il2cpp_type_to_patch_type(patch_handle_t type) {
                 }
             }
 
+            patchlib_free(parent);
+            patchlib_free(kclass);
+
             // 结构体 - 需要展开或按指针处理
-            // 对于复杂结构体，返回 POINTER 让调用者通过指针访问
-            result = PATCH_POINTER;
+            // 对于复杂结构体，返回 PATCH_STRUCT 让调用者通过指针访问
+            result = PATCH_STRUCT;
             break;
         }
         default:                   result = PATCH_OBJECT; break;
     }
 
     TEKLOG_TRACE("Converted IL2CPP type %d to patch type: %d", il2cpp_type, result);
+
     return result;
 }
 
@@ -185,7 +188,10 @@ int patchlib_method_get_token(patch_handle_t method) {
 }
 
 patch_type_t patchlib_method_get_return_type(patch_handle_t method) {
-    return il2cpp_type_to_patch_type(il2cpp_method_get_return_type(method));
+    patch_handle_t return_handle = il2cpp_method_get_return_type(method);
+    patch_type_t r = il2cpp_type_to_patch_type(return_handle);
+    patchlib_free(return_handle);
+    return r;
 }
 
 bool patchlib_method_get_signature(patch_handle_t method, patch_method_signature_t* signature) {
@@ -198,20 +204,25 @@ bool patchlib_method_get_signature(patch_handle_t method, patch_method_signature
 
     signature->method = method;
     signature->token = patchlib_method_get_token(signature->method);
+    signature->return_type_handle = il2cpp_method_get_return_type(method);
     signature->return_type = patchlib_method_get_return_type(method);
     signature->is_instance = patchlib_method_is_instance(method);
     tefstd_vector_init(&signature->arg_types, sizeof(patch_type_t));
     tefstd_vector_init(&signature->arg_names, sizeof(const char*));
+    tefstd_vector_init(&signature->arg_type_handles, sizeof(patch_handle_t));
 
     const int param_count = patchlib_method_get_param_count(method);
     TEKLOG_DEBUG("Method signature: return_type=%d, is_instance=%s, param_count=%d",
                  signature->return_type, signature->is_instance ? "true" : "false", param_count);
 
     for (int i = 0; i < param_count; ++i) {
-        patch_type_t t = il2cpp_type_to_patch_type(il2cpp_method_get_param(method, i));
+        patch_handle_t param_type = il2cpp_method_get_param(method, i);
+        patch_handle_t param = il2cpp_class_from_type(param_type);
+        patch_type_t t = il2cpp_type_to_patch_type(param_type);
         const char* n = il2cpp_method_get_param_name(method, i);
         tefstd_vector_push_back(&signature->arg_types, &t);
         tefstd_vector_push_back(&signature->arg_names, &n);
+        tefstd_vector_push_back(&signature->arg_type_handles, &param);
         TEKLOG_DEBUG("Parameter %d type: %d", i, t);
     }
 
@@ -223,9 +234,21 @@ bool patchlib_method_get_signature(patch_handle_t method, patch_method_signature
 bool patchlib_method_signature_free(patch_method_signature_t* signature) {
     tefstd_vector_destroy(&signature->arg_types);
     tefstd_vector_destroy(&signature->arg_names);
+
+#if !defined(__ANDROID__)
+    for (int i = 0; i < tefstd_vector_size(&signature->arg_type_handles); ++i) {
+        patch_handle_t handle = *(patch_handle_t*)tefstd_vector_at(&signature->arg_type_handles, i);
+        patchlib_free(handle);
+    }
+#endif
+
+    tefstd_vector_destroy(&signature->arg_type_handles);
+
     signature->method = PATCH_NULL;
     signature->is_instance = 0;
     signature->return_type = PATCH_VOID;
+
+    patchlib_free(signature->return_type_handle);
 
     return true;
 }

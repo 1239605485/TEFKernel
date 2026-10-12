@@ -105,11 +105,16 @@ bool patchlib_dictionary_add(patch_handle_t dictionary, void* key, void* value) 
 
     init_dictionary_class();
 
-    patch_handle_t method_add = patchlib_type_get_method_by_param_count(il2cpp_object_get_class(dictionary), "Add", 2);
+    patch_handle_t p_diy_cls = il2cpp_object_get_class(dictionary);
+
+    patch_handle_t method_add = patchlib_type_get_method_by_param_count(p_diy_cls, "Add", 2);
     if (!method_add) {
         TEKLOG_ERROR("Failed to find Add method");
+        patchlib_free(p_diy_cls);
         return false;
     }
+
+    patchlib_free(p_diy_cls);
     TEKLOG_DEBUG("Add method found: %p", method_add);
 
     void* args[2] = {key, value};
@@ -132,11 +137,16 @@ bool patchlib_dictionary_get_value(patch_handle_t dictionary, void* key, void* o
 
     init_dictionary_class();
 
-    patch_handle_t method_get_item = patchlib_type_get_method_by_param_count(il2cpp_object_get_class(dictionary), "get_Item", 1);
+    patch_handle_t p_diy_cls = il2cpp_object_get_class(dictionary);
+
+    patch_handle_t method_get_item = patchlib_type_get_method_by_param_count(p_diy_cls, "get_Item", 1);
     if (!method_get_item) {
         TEKLOG_ERROR("Failed to find get_Item method");
+        patchlib_free(p_diy_cls);
         return false;
     }
+
+    patchlib_free(p_diy_cls);
     TEKLOG_DEBUG("get_Item method found: %p", method_get_item);
 
     void* args[1] = {key};
@@ -159,11 +169,15 @@ bool patchlib_dictionary_set_value(patch_handle_t dictionary, void* key, void* v
 
     init_dictionary_class();
 
-    patch_handle_t method_set_item = patchlib_type_get_method_by_param_count(il2cpp_object_get_class(dictionary), "set_Item", 2);
+    patch_handle_t p_diy_cls = il2cpp_object_get_class(dictionary);
+
+    patch_handle_t method_set_item = patchlib_type_get_method_by_param_count(p_diy_cls, "set_Item", 2);
     if (!method_set_item) {
         TEKLOG_ERROR("Failed to find set_Item method");
+        patchlib_free(p_diy_cls);
         return false;
     }
+    patchlib_free(p_diy_cls);
     TEKLOG_DEBUG("set_Item method found: %p", method_set_item);
 
     void* args[2] = {key, value};
@@ -185,11 +199,15 @@ bool patchlib_dictionary_clear(patch_handle_t dictionary) {
 
     init_dictionary_class();
 
-    patch_handle_t method_clear = patchlib_type_get_method_by_param_count(il2cpp_object_get_class(dictionary), "Clear", 0);
+    patch_handle_t p_diy_cls = il2cpp_object_get_class(dictionary);
+
+    patch_handle_t method_clear = patchlib_type_get_method_by_param_count(p_diy_cls, "Clear", 0);
     if (!method_clear) {
         TEKLOG_ERROR("Failed to find Clear method");
+        patchlib_free(p_diy_cls);
         return false;
     }
+    patchlib_free(p_diy_cls);
     TEKLOG_DEBUG("Clear method found: %p", method_clear);
 
 
@@ -213,11 +231,15 @@ size_t patchlib_dictionary_length(patch_handle_t dictionary) {
 
     init_dictionary_class();
 
-    patch_handle_t method_get_count = patchlib_type_get_method_by_param_count(il2cpp_object_get_class(dictionary), "get_Count", 0);
+    patch_handle_t p_diy_cls = il2cpp_object_get_class(dictionary);
+
+    patch_handle_t method_get_count = patchlib_type_get_method_by_param_count(p_diy_cls, "get_Count", 0);
     if (!method_get_count) {
         TEKLOG_ERROR("Failed to find get_Count method");
+        patchlib_free(p_diy_cls);
         return 0;
     }
+    patchlib_free(p_diy_cls);
     TEKLOG_DEBUG("get_Count method found: %p", method_get_count);
 
     int count = 0;
@@ -241,11 +263,15 @@ bool patchlib_dictionary_remove(patch_handle_t dictionary, void* key) {
 
     init_dictionary_class();
 
-    patch_handle_t method_remove = patchlib_type_get_method_by_param_count(il2cpp_object_get_class(dictionary), "Remove", 1);
+    patch_handle_t p_diy_cls = il2cpp_object_get_class(dictionary);
+
+    patch_handle_t method_remove = patchlib_type_get_method_by_param_count(p_diy_cls, "Remove", 1);
     if (!method_remove) {
         TEKLOG_ERROR("Failed to find Remove method");
+        patchlib_free(p_diy_cls);
         return false;
     }
+    patchlib_free(p_diy_cls);
     TEKLOG_DEBUG("Remove method found: %p", method_remove);
 
     void* args[1] = {key};

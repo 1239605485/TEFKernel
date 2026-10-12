@@ -74,28 +74,25 @@ patch_handle_t patchlib_list_create(size_t capacity, patch_handle_t type) {
     }
     TEKLOG_DEBUG("List constructor found: %p", ctor);
 
-    patch_handle_t instance = patchlib_type_new_instance(generic_type);
-    if (!instance) {
-        TEKLOG_ERROR("Failed to create list instance");
-        tefstd_vector_destroy(&v);
-        return PATCH_NULL;
-    }
-    TEKLOG_DEBUG("List instance created: %p", instance);
+    patch_handle_t instance = PATCH_NULL;
 
     // 使用 patchlib_method_invoke_args 调用构造函数
     int capacity_arg = (int)capacity;
     void* args[1] = { &capacity_arg };
 
-    bool result = patchlib_method_invoke_args(ctor, instance, NULL, args);
-    if (result) {
-        TEKLOG_INFO("List created successfully: %p (capacity: %zu)", instance, capacity);
-    } else {
-        TEKLOG_ERROR("Failed to call list constructor");
-        il2cpp_free(instance);
-        instance = PATCH_NULL;
+    if (!patchlib_constructor_invoke(ctor, &instance, args)) {
+        TEKLOG_ERROR("Failed to create list instance");
+        tefstd_vector_destroy(&v);
+        patchlib_free(ctor);
+        patchlib_free(generic_type);
+        return PATCH_NULL;
     }
+    TEKLOG_DEBUG("List instance created: %p", instance);
 
     tefstd_vector_destroy(&v);
+    patchlib_free(ctor);
+    patchlib_free(generic_type);
+
     return instance;
 }
 
@@ -109,14 +106,21 @@ bool patchlib_list_copy_from(patch_handle_t list, patch_handle_t array) {
 
     init_list_class();
 
-    patch_handle_t field_items = patchlib_type_get_field(il2cpp_object_get_class(list), "_items");
+    patch_handle_t p_lcls = il2cpp_object_get_class(list);
+
+    patch_handle_t field_items = patchlib_type_get_field(p_lcls, "_items");
     if (!field_items) {
         TEKLOG_ERROR("Failed to find _items field");
+        patchlib_free(p_lcls);
         return false;
     }
+    patchlib_free(p_lcls);
     TEKLOG_DEBUG("Found _items field: %p", field_items);
 
     patchlib_field_set_value(field_items, list, &array);
+
+    patchlib_free(field_items);
+
     return true;
 }
 
@@ -130,15 +134,20 @@ bool patchlib_list_add(patch_handle_t list, void* value) {
 
     init_list_class();
 
-    patch_handle_t method_add = patchlib_type_get_method_by_param_count(il2cpp_object_get_class(list), "Add", 1);
+    patch_handle_t p_lcls = il2cpp_object_get_class(list);
+
+    patch_handle_t method_add = patchlib_type_get_method_by_param_count(p_lcls, "Add", 1);
     if (!method_add) {
         TEKLOG_ERROR("Failed to find Add method");
+        patchlib_free(p_lcls);
         return false;
     }
+    patchlib_free(p_lcls);
     TEKLOG_DEBUG("Add method found: %p", method_add);
 
     void* args[1] = { value };
     bool result = patchlib_method_invoke_args(method_add, list, NULL, args);
+    patchlib_free(method_add);
     TEKLOG_DEBUG("List add operation %s", result ? "succeeded" : "failed");
     return result;
 }
@@ -153,15 +162,20 @@ bool patchlib_list_remove(patch_handle_t list, void* value) {
 
     init_list_class();
 
-    patch_handle_t method_remove = patchlib_type_get_method_by_param_count(il2cpp_object_get_class(list), "Remove", 1);
+    patch_handle_t p_lcls = il2cpp_object_get_class(list);
+
+    patch_handle_t method_remove = patchlib_type_get_method_by_param_count(p_lcls, "Remove", 1);
     if (!method_remove) {
         TEKLOG_ERROR("Failed to find Remove method");
+        patchlib_free(p_lcls);
         return false;
     }
+    patchlib_free(p_lcls);
     TEKLOG_DEBUG("Remove method found: %p", method_remove);
 
     void* args[1] = { value };
     bool result = patchlib_method_invoke_args(method_remove, list, NULL, args);
+    patchlib_free(method_remove);
     TEKLOG_DEBUG("List remove operation %s", result ? "succeeded" : "failed");
     return result;
 }
@@ -176,17 +190,22 @@ bool patchlib_list_remove_at(patch_handle_t list, const size_t index) {
 
     init_list_class();
 
-    patch_handle_t method_remove_at = patchlib_type_get_method_by_param_count(il2cpp_object_get_class(list), "RemoveAt", 1);
+    patch_handle_t p_lcls = il2cpp_object_get_class(list);
+
+    patch_handle_t method_remove_at = patchlib_type_get_method_by_param_count(p_lcls, "RemoveAt", 1);
     if (!method_remove_at) {
         TEKLOG_ERROR("Failed to find RemoveAt method");
+        patchlib_free(p_lcls);
         return false;
     }
+    patchlib_free(p_lcls);
     TEKLOG_DEBUG("RemoveAt method found: %p", method_remove_at);
 
     int index_arg = (int)index;
     void* args[1] = { &index_arg };
 
     bool result = patchlib_method_invoke_args(method_remove_at, list, NULL, args);
+    patchlib_free(method_remove_at);
     TEKLOG_DEBUG("RemoveAt operation %s", result ? "succeeded" : "failed");
     return result;
 }
@@ -201,14 +220,19 @@ bool patchlib_list_clear(patch_handle_t list) {
 
     init_list_class();
 
-    patch_handle_t method_clear = patchlib_type_get_method_by_param_count(il2cpp_object_get_class(list), "Clear", 0);
+    patch_handle_t p_lcls = il2cpp_object_get_class(list);
+
+    patch_handle_t method_clear = patchlib_type_get_method_by_param_count(p_lcls, "Clear", 0);
     if (!method_clear) {
         TEKLOG_ERROR("Failed to find Clear method");
+        patchlib_free(p_lcls);
         return false;
     }
+    patchlib_free(p_lcls);
     TEKLOG_DEBUG("Clear method found: %p", method_clear);
 
     bool result = patchlib_method_invoke_args(method_clear, list, NULL, NULL);
+    patchlib_free(method_clear);
     TEKLOG_DEBUG("List clear operation %s", result ? "succeeded" : "failed");
     return result;
 }
@@ -221,35 +245,20 @@ patch_handle_t patchlib_list_get_array(patch_handle_t list) {
         return PATCH_NULL;
     }
 
-    patch_handle_t field_items = patchlib_type_get_field(il2cpp_object_get_class(list), "_items");
+    patch_handle_t p_lcls = il2cpp_object_get_class(list);
+
+    patch_handle_t field_items = patchlib_type_get_field(p_lcls, "_items");
     if (!field_items) {
         TEKLOG_ERROR("Failed to find _items field");
+        patchlib_free(p_lcls);
         return PATCH_NULL;
     }
+    patchlib_free(p_lcls);
     TEKLOG_DEBUG("Found _items field: %p", field_items);
 
     patch_handle_t array = PATCH_NULL;
     patchlib_field_get_value(field_items, list, &array);
+    patchlib_free(field_items);
+
     return array;
-}
-
-size_t patchlib_list_get_count(patch_handle_t list) {
-    TEKLOG_DEBUG("patchlib_list_get_count called: list=%p", list);
-
-    if (!patchlib_is_valid(list)) {
-        TEKLOG_ERROR("Invalid list handle");
-        return 0;
-    }
-
-    patch_handle_t field_count = patchlib_type_get_field(il2cpp_object_get_class(list), "_size");
-    if (!field_count) {
-        TEKLOG_ERROR("Failed to find _size field");
-        return 0;
-    }
-    TEKLOG_DEBUG("Found _size field: %p", field_count);
-
-    size_t count = 0;
-    patchlib_field_get_value(field_count, list, &count);
-    TEKLOG_DEBUG("List count: %zu", count);
-    return count;
 }

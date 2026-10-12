@@ -33,6 +33,7 @@
 #include "patchlib/field.h"
 #include "patchlib/method.h"
 #include "patchlib/struct/array.h"
+#include "patchlib/struct/string.h"
 #include "terraria/asset.h"
 #include "terraria/texture2d.h"
 
@@ -75,7 +76,7 @@ static void unknown_item_early_init(terraria_item_handle_t* current) {
 // 未知物品的属性设置
 static void unknown_item_set_defaults(terraria_item_handle_t *current,
                                       patch_handle_t instance) {
-  /*
+
     patch_handle_t item_class = patchlib_type_get_type("Terraria", "Item");
     if (patchlib_is_valid(item_class)) {
       patch_handle_t f_name_override =
@@ -92,7 +93,7 @@ static void unknown_item_set_defaults(terraria_item_handle_t *current,
         patchlib_free(f_bestiary_notes);
       }
       patchlib_free(item_class);
-    }*/
+    }
 }
 
 // 生成未知物品纹理
@@ -171,7 +172,7 @@ static terraria_item_handle_t unknown_item = {
     .internal_name = "unknown",
     .has_tooltip = false,
     .runtime_id = -1,
-    .item_ops = {.early_init = NULL /*unknown_item_early_init*/,
+    .item_ops = {.early_init = unknown_item_early_init /*unknown_item_early_init*/,
                  .init_static = NULL,
                  .set_defaults = unknown_item_set_defaults,
                  .can_use = NULL,
@@ -314,7 +315,7 @@ static int compare_item(const void *a, const void *b) {
 // 初始化
 
 static void resize_array(const char *ns, const char *cls, const char *fid,
-                         patch_handle_t type, int nsize);
+                         patch_handle_t type, int nsize, void* dvalue);
 
 #if !__ANDROID__
 // PC端：AssetInitializer.LoadTextures 会按 TextureAssets.Item 的新长度遍历，
@@ -509,7 +510,7 @@ static void resize_item_animations(const int new_size) {
   patch_handle_t field = patchlib_type_get_field(main_class, "itemAnimations");
   if (patchlib_is_valid(field)) {
     resize_array("Terraria", "Main", "itemAnimations", draw_animation_class,
-                 new_size);
+                 new_size, NULL);
     patchlib_free(field);
   } else {
     TEKLOG_ERROR(
@@ -539,46 +540,27 @@ static void resize_lang_caches(const int base_count, const int new_size) {
     return;
   }
 
+  patch_handle_t f_none = patchlib_type_get_field(tooltip_class, "None");
+  patch_handle_t none = PATCH_NULL;
+  if (patchlib_is_valid(f_none))
+    patchlib_field_get_value(f_none, NULL, &none);
   resize_array("Terraria", "Lang", "_itemTooltipCache", tooltip_class,
-               new_size);
-  {
-    patch_handle_t lang_class = patchlib_type_get_type("Terraria", "Lang");
-    patch_handle_t f_cache =
-        patchlib_type_get_field(lang_class, "_itemTooltipCache");
-    patch_handle_t f_none = patchlib_type_get_field(tooltip_class, "None");
-    patch_handle_t cache = PATCH_NULL;
-    patch_handle_t none = PATCH_NULL;
-    if (patchlib_is_valid(f_cache))
-      patchlib_field_get_value(f_cache, NULL, &cache);
-    if (patchlib_is_valid(f_none))
-      patchlib_field_get_value(f_none, NULL, &none);
-    if (patchlib_is_valid(cache) && patchlib_is_valid(none)) {
-      for (int i = base_count; i < new_size; i++) {
-        patchlib_array_set(cache, (size_t)i, &none);
-      }
-    }
-    if (patchlib_is_valid(cache))
-      patchlib_free(cache);
-    if (patchlib_is_valid(none))
-      patchlib_free(none);
-    if (patchlib_is_valid(f_cache))
-      patchlib_free(f_cache);
-    if (patchlib_is_valid(f_none))
-      patchlib_free(f_none);
-    patchlib_free(lang_class);
-  }
+               new_size, NULL);
+
+  if (patchlib_is_valid(none))
+    patchlib_free(none);
+  if (patchlib_is_valid(f_none))
+    patchlib_free(f_none);
 
   // _itemNameCache: LocalizedText[]（GetItemName 对 null 槽位有判断，无需填充）
-  resize_array("Terraria", "Lang", "_itemNameCache", name_class, new_size);
+  resize_array("Terraria", "Lang", "_itemNameCache", name_class, new_size, NULL);
 
   // _layerIndexForItemType: int[]（GetSortingLayerIndex 无边界检查，
   // 物品进背包触发排序时按 type 索引，越界导致物品"消失"）
-  {
-    patch_handle_t int32_type = patchlib_get_basic_type(PATCH_INT32);
-    resize_array("Terraria.UI", "ItemSorting", "_layerIndexForItemType",
-                 int32_type, new_size);
-    patchlib_free(int32_type);
-  }
+  patch_handle_t int32_type = patchlib_get_basic_type(PATCH_INT32);
+  resize_array("Terraria.UI", "ItemSorting", "_layerIndexForItemType",
+               int32_type, new_size, NULL);
+  patchlib_free(int32_type);
 
   patchlib_free(tooltip_class);
   patchlib_free(name_class);
@@ -794,9 +776,9 @@ void terraria_item_manager_init_texture2d() {
   patch_handle_t asset_type = terraria_asset_get_generic_class(texture_type);
 
   resize_array("Terraria.GameContent", "TextureAssets", "Item", asset_type,
-               terraria_item_manager_get_count());
+               terraria_item_manager_get_count(), NULL);
   resize_array("Terraria.GameContent", "TextureAssets", "ItemFlame", asset_type,
-               terraria_item_manager_get_count());
+               terraria_item_manager_get_count(), NULL);
 
   patchlib_free(texture_type);
   patchlib_free(asset_type);
@@ -894,7 +876,7 @@ void terraria_item_manager_init_texture2d() {
 }
 
 static void resize_array(const char *ns, const char *cls, const char *fid,
-                         patch_handle_t type, const int nsize) {
+                         patch_handle_t type, const int nsize, void* dvalue) {
   // 获取类型和字段
   patch_handle_t class_handle = patchlib_type_get_type(ns, cls);
   if (!patchlib_is_valid(class_handle)) {
@@ -919,6 +901,7 @@ static void resize_array(const char *ns, const char *cls, const char *fid,
         ns, cls, fid, nsize);
     patch_handle_t narray = patchlib_array_create(nsize, type);
     if (patchlib_is_valid(narray)) {
+      if (dvalue) patchlib_array_fill(narray, dvalue);
       patchlib_field_set_value(field, NULL, &narray);
       TEKLOG_INFO("resize_array: Created new array %s.%s.%s of size %d", ns,
                   cls, fid, nsize);
@@ -954,6 +937,7 @@ static void resize_array(const char *ns, const char *cls, const char *fid,
     patchlib_free(class_handle);
     return;
   }
+  if (dvalue) patchlib_array_fill(narray, dvalue);
 
   // 复制所有旧数据到新数组
   if (old_len > 0) {
@@ -979,15 +963,19 @@ void terraria_item_manager_resize() {
   const int new_size = terraria_item_manager_get_count();
 
   patch_handle_t bool_type = patchlib_get_basic_type(PATCH_BOOL);
+  patch_handle_t int_type = patchlib_get_basic_type(PATCH_INT32);
+
+  static int d_cached_item_spawns_type = -1;
 
   // 注意：这些数组在 Terraria 中用于存储物品相关的数据
-  resize_array("Terraria", "Item", "claw", bool_type, new_size);
-  resize_array("Terraria", "Item", "staff", bool_type, new_size);
+  resize_array("Terraria", "Item", "claw", bool_type, new_size, NULL);
+  resize_array("Terraria", "Item", "staff", bool_type, new_size, NULL);
+  resize_array("Terraria", "Item", "cachedItemSpawnsByType", int_type, new_size, &d_cached_item_spawns_type);
 
 #if __ANDROID__
-  resize_array("Terraria", "Player", "ItemUsesRightFire", bool_type, new_size);
+  resize_array("Terraria", "Player", "ItemUsesRightFire", bool_type, new_size, NULL);
   resize_array("", "VirtualControllerInputState", "ItemCategories",
-               patchlib_get_basic_type(PATCH_INT32), new_size);
+               int_type, new_size, NULL);
 #endif
   // 一次性扩容 ItemID.Sets 所有按 ItemID.Count 定长的数组
   resize_all_itemid_sets(terraria_item_id_get_count(), new_size);
@@ -999,6 +987,7 @@ void terraria_item_manager_resize() {
   resize_armor_set_bonuses(terraria_item_id_get_count(), new_size);
 
   patchlib_free(bool_type);
+  patchlib_free(int_type);
 }
 
 int terraria_item_manager_get_count() {

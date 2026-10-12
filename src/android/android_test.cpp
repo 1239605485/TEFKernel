@@ -47,6 +47,15 @@ void add_r(void) {
             1);
         terraria_recipe_add();
     }
+
+
+    terraria_recipe_set_result(9,
+                                   9999);
+    terraria_recipe_set_material(
+        (int[2])
+        {3384, 1},
+        1);
+    terraria_recipe_add();
 }
 
 void start_test(void) { /*terraria_recipe_manager_register_callback(add_r);*/ }

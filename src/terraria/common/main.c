@@ -27,10 +27,12 @@
 #include "patchlib/method.h"
 
 #include "internal/terraria/item_manager.h"
+#include "patchlib/property.h"
 
 static patch_handle_t get_graphics_device = PATCH_NULL;
 static patch_handle_t cur_release = PATCH_NULL;
 static patch_handle_t instance = PATCH_NULL;
+static patch_handle_t local_player = PATCH_NULL;
 
 static bool initialize_prefix(patch_handle_t this, void **args,
                                const patch_method_signature_t *sig_info, void *result) {
@@ -41,6 +43,7 @@ static bool initialize_prefix(patch_handle_t this, void **args,
 
     if (custom_count > 0) {
         terraria_item_manager_assign_ids(base_count);
+        terraria_item_manager_resize();
         TEKLOG_INFO("Assigned IDs and resized arrays");
     }
     
@@ -71,7 +74,7 @@ static void initialize_almost_everything_postfix(patch_handle_t this, void **arg
         terraria_item_manager_init_texture2d();
         TEKLOG_INFO("Arrays resized and textures initialized");
         
-        terraria_item_manager_init_localized_text();
+        // terraria_item_manager_init_localized_text();
     }
 
     // 初始化静态数据
@@ -136,6 +139,10 @@ void terraria_main_init(const bool is_server) {
         TEKLOG_DEBUG("Got instance field: %p", instance);
     }
 
+    patch_handle_t local_player_property = patchlib_type_get_property(main_class, "LocalPlayer");
+    local_player = patchlib_property_get_get_method(local_player_property);
+    patchlib_free(local_player_property);
+
     patch_handle_t initialize_method = patchlib_type_get_method_by_param_count(main_class, "Initialize", 0);
     if (!patchlib_is_valid(initialize_method)) {
         TEKLOG_ERROR("Failed to get Initialize method");
@@ -193,4 +200,14 @@ patch_handle_t terraria_main_get_graphics_device() {
     patchlib_free(main_instance);
 
     return graphics_device;
+}
+
+patch_handle_t terraria_main_get_local_player() {
+#if defined(__ANDROID__)
+    return ((void*(*)())patchlib_method_get_pointer(local_player))();
+#else
+    patch_handle_t player = PATCH_NULL;
+    patchlib_method_invoke_args(local_player, NULL, &player, NULL);
+    return player;
+#endif
 }

@@ -49,7 +49,14 @@ void *create_type_array_from_vector(const tefstd_vector_t *type_vector, void *el
  * @param type patch类型
  * @return ffi_type
  */
-ffi_type* patch_type_to_ffi_type(patch_type_t type);
+ffi_type* patch_type_to_ffi_type(patch_type_t type, patch_handle_t struct_type);
+
+/**
+ * @brief 释放由 patch_type_to_ffi_type 为结构体动态分配的 ffi_type
+ * @param ffi  要释放的 ffi_type 指针（可为 NULL）
+ * @param struct_type 对应的 patch 结构体句柄，用于确定字段数量
+ */
+void patch_ffi_type_free(ffi_type *ffi, patch_handle_t struct_type);
 
 extern patch_handle_t patchlib_MakeGenericType;
 extern patch_handle_t patchlib_MakeGenericMethod_impl;

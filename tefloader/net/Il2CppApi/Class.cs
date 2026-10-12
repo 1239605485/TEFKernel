@@ -82,6 +82,16 @@ public static class Class
         return GCHandle.ToIntPtr(classHandle);
     }
 
+    public static int il2cpp_class_value_size(IntPtr classPtr, ref uint? align)
+    {
+        var classHandle = GCHandle.FromIntPtr(classPtr);
+        var type = (Type)classHandle.Target;
+
+        if (align != null) align = (uint)Marshal.SizeOf(type);
+        
+        return Marshal.SizeOf(type);
+    }
+
     // 模拟 il2cpp_class_get_nested_types (C风格数组)
     public static unsafe IntPtr* il2cpp_class_get_nested_types(IntPtr classPtr, out int size)
     {

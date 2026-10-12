@@ -25,6 +25,10 @@
 #include "../il2cpp_api.h"
 #include "internal/log.h"
 
+#include <stdlib.h>
+
+#include "patchlib/field.h"
+
 typedef struct il2cpp_array_t {
     void *m_class;
     void *m_monitor;
@@ -86,7 +90,7 @@ void *create_type_array_from_vector(const tefstd_vector_t *type_vector, void *el
     return array;
 }
 
-ffi_type* patch_type_to_ffi_type(const patch_type_t type) {
+ffi_type* patch_type_to_ffi_type(const patch_type_t type, patch_handle_t struct_type) {
     TEKLOG_DEBUG("patch_type_to_ffi_type called: type=%d", type);
 
     ffi_type* result = NULL;
@@ -106,11 +110,92 @@ ffi_type* patch_type_to_ffi_type(const patch_type_t type) {
         case PATCH_FLOAT:   result = &ffi_type_float; type_name = "FLOAT"; break;
         case PATCH_DOUBLE:  result = &ffi_type_double; type_name = "DOUBLE"; break;
         case PATCH_CHAR:    result = &ffi_type_uint32; type_name = "CHAR"; break;
+        case PATCH_STRUCT: {
+            tefstd_vector_t fields;
+            patchlib_type_get_fields(struct_type, false, &fields);
+
+            const size_t field_count = tefstd_vector_size(&fields);
+
+            ffi_type **elements = malloc((field_count + 1) * sizeof(ffi_type *));
+
+            for (int i = 0; i < field_count; i++) {
+                // 你需要通过 struct_type 和索引获取每个字段的类型句柄
+                // 假设 patchlib_struct_get_field_type 返回一个表示字段类型的 patch_handle_t
+                patch_handle_t field_type_handle = *(patch_handle_t*)tefstd_vector_at(&fields, i);
+                elements[i] = patch_type_to_ffi_type(
+                    patchlib_field_get_type(field_type_handle), // 获取 PATCH_* 类型
+                    il2cpp_class_from_type(il2cpp_field_get_type(field_type_handle)) // 如果是嵌套结构体，传入其句柄
+                );
+            }
+            tefstd_vector_destroy(&fields);
+            elements[field_count] = NULL;
+
+            ffi_type *struct_ffi = malloc(sizeof(ffi_type));
+            if (!struct_ffi) {
+                free(elements);
+                result = &ffi_type_pointer;
+                type_name = "STRUCT_FFI_ALLOC_FAIL";
+                break;
+            }
+
+            struct_ffi->size = 0;
+            struct_ffi->alignment = 0;
+            struct_ffi->type = FFI_TYPE_STRUCT;
+            struct_ffi->elements = elements;
+
+            result = struct_ffi;
+            type_name = "STRUCT";
+            break;
+        }
         default:            result = &ffi_type_pointer; type_name = "POINTER"; break;
     }
 
     TEKLOG_DEBUG("Converted patch type %d (%s) to FFI type: %p", type, type_name, result);
     return result;
+}
+
+void patch_ffi_type_free(ffi_type *ffi, patch_handle_t struct_type) {
+    if (ffi == NULL) {
+        return;
+    }
+
+    // 基元/指针等静态 ffi_type 不归我们管
+    if (ffi->type != FFI_TYPE_STRUCT) {
+        return;
+    }
+
+    // 1. 递归释放嵌套结构体字段
+    if (ffi->elements != NULL) {
+        tefstd_vector_t fields;
+        patchlib_type_get_fields(struct_type, false, &fields);
+
+        const size_t field_count = tefstd_vector_size(&fields);
+
+        for (size_t i = 0; i < field_count; i++) {
+            ffi_type *elem = ffi->elements[i];
+            if (elem == NULL) {
+                break;
+            }
+
+            // 只有结构体字段才是动态分配的
+            if (elem->type == FFI_TYPE_STRUCT) {
+                patch_handle_t field_handle = *(patch_handle_t*)tefstd_vector_at(&fields, i);
+                patch_type_t field_patch_type = patchlib_field_get_type(field_handle);
+                // 正常情况下这里必然 == PATCH_STRUCT，保险起见再判一次
+                if (field_patch_type == PATCH_STRUCT) {
+                    patch_handle_t field_struct_handle = il2cpp_class_from_type(il2cpp_field_get_type(field_handle));
+                    patch_ffi_type_free(elem, field_struct_handle);
+                }
+            }
+        }
+
+        tefstd_vector_destroy(&fields);
+
+        free(ffi->elements);
+        ffi->elements = NULL;
+    }
+
+    free(ffi);
 }
 
 // 全局变量定义

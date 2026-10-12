@@ -181,10 +181,11 @@ size_t patchlib_field_get_size(patch_handle_t field) {
         return 0;
     }
 
-    const int field_type = il2cpp_type_get_type(il2cpp_field_get_type(field));
+    patch_handle_t field_type = il2cpp_field_get_type(field);
+    const int field_type_emu = il2cpp_type_get_type(field_type);
     size_t result = 0;
 
-    switch (field_type) {
+    switch (field_type_emu) {
         case IL2CPP_TYPE_BOOLEAN: // bool
         case IL2CPP_TYPE_I1: // sbyte
         case IL2CPP_TYPE_U1: result = 1;
@@ -201,10 +202,14 @@ size_t patchlib_field_get_size(patch_handle_t field) {
         case IL2CPP_TYPE_U8: // ulong
         case IL2CPP_TYPE_R8: result = 8;
             break; // double
+        case IL2CPP_TYPE_VALUETYPE:
+            result = il2cpp_class_value_size(il2cpp_class_from_il2cpp_type(field_type), NULL);
         default:
             result = sizeof(void *);
             break;
     }
+
+    patchlib_free(field_type);
 
     return result;
 }

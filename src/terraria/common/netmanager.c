@@ -937,9 +937,13 @@ void terraria_netmanager_init() {
 
 #if __ANDROID__
 typedef struct il2cpp_array_t {
+    // ReSharper disable once CppDeclaratorNeverUsed
     void *m_class;
+    // ReSharper disable once CppDeclaratorNeverUsed
     void *m_monitor;
+    // ReSharper disable once CppDeclaratorNeverUsed
     void *m_bounds;
+    // ReSharper disable once CppDeclaratorNeverUsed
     uint32_t m_length;
 } il2cpp_array_t;
 #endif
@@ -1071,10 +1075,12 @@ static bool send_data_hook(patch_handle_t instance, void **args,
         TEKLOG_DEBUG("SendData: msgType=2, g_error_message_id=%d, details=%s",
                      terraria_netmanager_client_errors[remote_client],
                      terraria_netmanager_error_details[remote_client]);
-        patchlib_free(error_text);
 
         if (terraria_netmanager_client_errors[remote_client] == ERROR_MOD_REQUIRED ||
             terraria_netmanager_client_errors[remote_client] == ERROR_VERSION) {
+
+            patchlib_free(error_text);
+
             char error_msg[512];
             const char *error_type = terraria_netmanager_client_errors[remote_client] == ERROR_VERSION
                                          ? "Version mismatch"

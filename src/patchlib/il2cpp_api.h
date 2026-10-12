@@ -568,6 +568,16 @@ DEFINE_IL2CPP_API(void*, il2cpp_class_from_system_type, void* type)
 
 
 /**
+ * @brief 获取值类型大小
+ * @param klass 类指针(原始类型: Il2CppClass*)
+ * @param align [out] 对齐值
+ * @return 值类型大小
+ */
+DEFINE_IL2CPP_API(int32_t, il2cpp_class_value_size,
+                  void* klass, uint32_t * align)
+
+
+/**
  * @brief 通过名称获取字段
  * @param klass 类指针(原始类型: Il2CppClass*)
  * @param name 字段名
