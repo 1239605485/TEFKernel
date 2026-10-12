@@ -1034,6 +1034,105 @@ static void resize_array(const char *ns, const char *cls, const char *fid,
   patchlib_free(class_handle);
 }
 
+// 强制把 ItemID.Sets 中若干“按物品 type 索引、运行时会访问”的集合扩容到
+// new_size。与 resize_all_class_sets 不同：这里不要求旧长度恰好等于
+// ItemID.Count，只要旧长度 < new_size 就扩容。
+//
+// 背景：Main.UpdateWorld_Items 对每个 WorldItem.UpdateItem 做 try/catch，
+// 一旦自定义物品更新时抛 IndexOutOfRangeException，会被 Main.ignoreErrors
+// 静默吞掉并把该槽位换成空 WorldItem（表现为“掉落物存在一帧后消失”）。
+// WorldItem.UpdateItem 只会访问这些 ItemID.Sets 数组，因此在最终阶段再兜底
+// 强制扩一次，即使前面的批量扩容因静态构造时序/失败被跳过也能兜住。
+static void force_resize_itemid_set(const char *name, const int new_size) {
+  if (!name || new_size <= 0)
+    return;
+
+  patch_handle_t item_id_class =
+      patchlib_type_get_type("Terraria.ID", "ItemID");
+  if (!patchlib_is_valid(item_id_class)) {
+    TEKLOG_WARN("force_resize_itemid_set: ItemID not found");
+    return;
+  }
+  patch_handle_t sets_class =
+      patchlib_type_get_inner_type(item_id_class, "Sets");
+  patchlib_free(item_id_class);
+  if (!patchlib_is_valid(sets_class))
+    return;
+
+  patch_handle_t field = patchlib_type_get_field(sets_class, name);
+  if (!patchlib_is_valid(field)) {
+    patchlib_free(sets_class);
+    return;
+  }
+
+  patch_handle_t array = PATCH_NULL;
+  patchlib_field_get_value(field, NULL, &array);
+  if (patchlib_is_valid(array)) {
+    const size_t len = patchlib_array_length(array);
+    if (len > 0 && len < (size_t)new_size) {
+      patch_handle_t new_array =
+          patchlib_array_resize(array, (size_t)new_size, NULL);
+      if (patchlib_is_valid(new_array)) {
+        fill_new_slots_with_modal(array, new_array, len, (size_t)new_size);
+        patchlib_field_set_value(field, NULL, &new_array);
+        TEKLOG_INFO("force_resize_itemid_set: ✅ ItemID.Sets.%s (%zu -> %d)",
+                    name, len, new_size);
+        patchlib_free(new_array);
+      } else {
+        TEKLOG_ERROR("force_resize_itemid_set: failed to resize %s", name);
+      }
+    }
+    patchlib_free(array);
+  }
+
+  patchlib_free(field);
+  patchlib_free(sets_class);
+}
+
+// WorldItem.UpdateItem / 拾取 / 绘制路径上真正会被访问到的集合。
+static void force_resize_critical_item_sets(const int new_size) {
+  static const char *names[] = {
+      // WorldItem.UpdateItem
+      "ItemNoGravity",
+      "RecoverableImportantItem",
+      "IsLavaImmuneRegardlessOfRarity",
+      "BossBag",
+      "Torches",
+      "WaterTorches",
+      "CommonCoin",
+      "CanPassivelyStackInWorldOverride",
+      "OnlyNeedOneInInventoryOverride",
+      // 拾取 / 背包
+      "IsAPickup",
+      "IgnoresEncumberingStone",
+      "NebulaPickup",
+      "ItemsThatShouldNotBeInInventory",
+      // 绘制 / 贴图
+      "IsFood",
+      "AnimatesAsSoul",
+      "TrapSigned",
+      "DrawUnsafeIndicator",
+      "ItemIconPulse",
+      "TextureCopyLoad",
+      // Item.NewItem / DropSelectedItem
+      "IsAMaterial",
+      "OverflowProtectionTimeOffset",
+      "DropWithGrabDelayForAllPlayers",
+      "Deprecated",
+      // 曾被排除、但同样按物品 type 索引的集合
+      "CanBeQuickusedOnGamepad",
+      "OnlyNeedOneInInventoryOverride",
+      "CanPassivelyStackInWorldOverride",
+      "ForceConsumption",
+      "ForcesBreaksSleeping",
+      "LockOnAimCompensation",
+      "NetUseSoundSync",
+  };
+
+  for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i)
+    force_resize_itemid_set(names[i], new_size);
+}
+
 void terraria_item_manager_resize() {
   const int new_size = terraria_item_manager_get_count();
 
@@ -1060,6 +1159,8 @@ void terraria_item_manager_resize() {
   resize_lang_caches(terraria_item_id_get_count(), new_size);
   // 护甲套装查询锯齿数组同步扩容（tooltip 生成路径）
   resize_armor_set_bonuses(terraria_item_id_get_count(), new_size);
+  // 兜底：强制扩容运行时物品更新/拾取/绘制会用到的 ItemID.Sets 集合
+  force_resize_critical_item_sets(new_size);
 
   patchlib_free(bool_type);
   patchlib_free(int_type);
