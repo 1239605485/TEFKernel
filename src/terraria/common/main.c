@@ -62,6 +62,19 @@ static bool initialize_prefix(patch_handle_t this, void **args,
     return false;
 }
 
+// Main.Initialize 结束时做最后一次扩容兜底。
+// Initialize_AlmostEverything 之后仍可能有内容（贴图/配方/内容采样）重建
+// 某些按 type 索引的静态表；这里再确认一次，避免自定义物品在
+// WorldItem.UpdateItem 中越界而被 Main.ignoreErrors 静默移除。
+static void initialize_postfix(patch_handle_t this, void **args, void *result,
+                               const patch_method_signature_t *sig_info) {
+    const size_t custom_count = tefstd_vector_size(&g_terraria_item_registry);
+    if (custom_count == 0)
+        return;
+    TEKLOG_INFO("Main.Initialize completed, final resizing pass...");
+    terraria_item_manager_resize();
+}
+
 
 static void initialize_almost_everything_postfix(patch_handle_t this, void **args, void *result,
                                  const patch_method_signature_t *sig_info) {
@@ -148,7 +161,7 @@ void terraria_main_init(const bool is_server) {
         TEKLOG_ERROR("Failed to get Initialize method");
     } else {
         TEKLOG_DEBUG("Got Initialize method: %p, installing hook", initialize_method);
-        patch_hook_id_t hook_id = patchlib_install_prepost_hook(initialize_method, initialize_prefix, NULL);
+        patch_hook_id_t hook_id = patchlib_install_prepost_hook(initialize_method, initialize_prefix, initialize_postfix);
         if (hook_id != PATCH_HOOK_INVALID_ID) {
             TEKLOG_INFO("Initialize hook installed successfully, ID: %d", hook_id);
         } else {

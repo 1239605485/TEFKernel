@@ -29,6 +29,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "internal/kernel_state.h"
 #include "internal/log.h"
 #include "patchlib/field.h"
 #include "patchlib/method.h"
@@ -191,6 +192,11 @@ static patch_handle_t f_item_tooltip_cache = PATCH_NULL;
 
 static patch_handle_t m_from_language_key = PATCH_NULL; // static ItemTooltip FromLanguageKey(short id, string key)
 
+// 自定义物品通用字段/方法句柄（通过 terraria_item_manager_get_item_ops 提供给存档等模块）
+static patch_handle_t f_item_prefix = PATCH_NULL;       // Item.prefix (byte)
+static patch_handle_t m_item_net_defaults = PATCH_NULL; // Item.netDefaults(int)
+static patch_handle_t m_item_prefix = PATCH_NULL;       // Item.Prefix(int)
+
 static void set_defaults_postfix(patch_handle_t this, void **args, void *result,
                                  const patch_method_signature_t *sig_info) {
   // 检查 args 是否有效
@@ -207,6 +213,8 @@ static void set_defaults_postfix(patch_handle_t this, void **args, void *result,
   if (nid < 0 || nid >= (int)custom_count) {
     return; // 非原版物品不打印日志
   }
+
+  TEKLOG_INFO("set_defaults_postfix: custom nid=%d, applying defaults", nid);
 
   // ⭐ 关键：强制恢复 type（SetDefaults 内部可能把它清空了）
   patchlib_field_set_value(f_type, this, args[0]);
@@ -225,7 +233,8 @@ static void set_defaults_postfix(patch_handle_t this, void **args, void *result,
     }
   }
 
-  patchlib_method_invoke_args(m_rebuild_tooltip, this, PATCH_NULL, NULL);
+  if (patchlib_is_valid(m_rebuild_tooltip))
+    patchlib_method_invoke_args(m_rebuild_tooltip, this, PATCH_NULL, NULL);
 }
 
 /*
@@ -342,6 +351,62 @@ static void load_textures_postfix(patch_handle_t this, void **args,
 // 索引这些集合（ItemIconPulse、TrapSigned、TextureCopyLoad 等），
 // 任何一个没扩容都会导致绘制自定义物品时
 // IndexOutOfRangeException（表现为图标"透明"或崩溃）。
+// 扩容后把新槽位填成“该集合的默认值”。
+// SetFactory 生成的集合大多有非 0 默认值（ToolTipDamageMultiplier=1、
+// BonusMeleeSpeedMultiplier=1、SortingPriority*=-1 等），而 array_resize 只把
+// 新槽清零，会导致自定义物品“伤害显示 0 / 攻击速度 0 / 不能排序”。
+// 这里用原数组里出现次数最多的元素作为默认值填充（对 bool/int/float 集合即 factory 默认值）。
+static void fill_new_slots_with_modal(patch_handle_t old_array,
+                                      patch_handle_t new_array,
+                                      const size_t old_len,
+                                      const size_t new_len) {
+  enum { MAX_UNIQ = 64, EBUF = 256 };
+  if (!patchlib_is_valid(old_array) || !patchlib_is_valid(new_array) ||
+      old_len == 0 || new_len <= old_len)
+    return;
+
+  uint64_t keys[MAX_UNIQ];
+  int counts[MAX_UNIQ];
+  uint8_t vals[MAX_UNIQ][EBUF];
+  int nu = 0;
+  uint8_t buf[EBUF];
+
+  for (size_t i = 0; i < old_len; ++i) {
+    memset(buf, 0, EBUF);
+    if (!patchlib_array_at(old_array, i, buf))
+      continue;
+    uint64_t key = 0;
+    memcpy(&key, buf, sizeof(key));
+    int found = -1;
+    for (int j = 0; j < nu; ++j) {
+      if (keys[j] == key) {
+        found = j;
+        break;
+      }
+    }
+    if (found >= 0) {
+      counts[found]++;
+    } else if (nu < MAX_UNIQ) {
+      keys[nu] = key;
+      memcpy(vals[nu], buf, EBUF);
+      counts[nu] = 1;
+      nu++;
+    }
+  }
+  if (nu == 0)
+    return;
+
+  int best = 0;
+  for (int j = 1; j < nu; ++j) {
+    if (counts[j] > counts[best])
+      best = j;
+  }
+  for (size_t i = old_len; i < new_len; ++i) {
+    if (!patchlib_array_set(new_array, i, vals[best]))
+      break; // 某些结构/引用元素无法写入，保持默认(0/null)即可
+  }
+}
+
 static void resize_all_class_sets(const char *ns, const char *cls,
                                   const char *inner, const int base_count,
                                   const int new_size) {
@@ -370,7 +435,12 @@ static void resize_all_class_sets(const char *ns, const char *cls,
     return;
   }
 
-  // ⭐ 需要排除的字段名称（非数组、多维数组、引用类型数组、List等）
+  // ⭐ 需要排除的字段名称（非数组、List、长度不等于 ItemID.Count 的数组等）
+  //
+  // 注意：FoodParticleColors / DrinkParticleColors（Color[][]）以及若干可空数组
+  // （NetUseSoundSync 等）也按 type 索引、长度等于 ItemID.Count，**必须一起扩容**；
+  // 否则游戏用自定义 id 索引时会抛 IndexOutOfRangeException，被
+  // Main.ignoreErrors 静默吞掉，导致 ItemCheck 半途中断（近战命中、射击等失效）。
   const char *EXCLUDED_FIELDS[] = {
       // 非数组
       "Factory", "DD2BannerEffect", "DefaultKillsForBannerNeeded", "Count",
@@ -378,21 +448,8 @@ static void resize_all_class_sets(const char *ns, const char *cls,
       // List<T> 类型
       "ItemsThatAreProcessedAfterNormalContentSample", "NonColorfulDyeItems",
 
-      // 多维数组 (Color[][])
-      "FoodParticleColors", "DrinkParticleColors",
-
-      /*
-      // 引用类型数组 (FlowerPacketInfo[], BannerEffect[], PlacementDetails[],
-      UniqueTagEffect[]) "DerivedPlacementDetails", "flowerPacketInfo",
-      "BannerStrength",
-      "UniqueTagEffects",
-      "ColorfulDyeValues",*/
-
-      // 其他特殊类型
-      "ItemsForStuffCannon", "Workbenches", "CanBeQuickusedOnGamepad",
-      "ForcesBreaksSleeping", "NetUseSoundSync", "ForceConsumption",
-      "OnlyNeedOneInInventoryOverride", "CanPassivelyStackInWorldOverride",
-      "LockOnAimCompensation"};
+      // 长度不等于 ItemID.Count 的数组
+      "ItemsForStuffCannon", "Workbenches"};
 
   int resized = 0;
   int skipped = 0;
@@ -452,6 +509,8 @@ static void resize_all_class_sets(const char *ns, const char *cls,
     patch_handle_t new_array = patchlib_array_resize(array, new_size, NULL);
 
     if (patchlib_is_valid(new_array)) {
+      // 新槽按该集合默认值（原数组众数）填充，而不是 0
+      fill_new_slots_with_modal(array, new_array, len, (size_t)new_size);
       patchlib_field_set_value(field, NULL, &new_array);
       TEKLOG_DEBUG(
           "resize_all_itemid_sets: ✅ resized ItemID.Sets.%s (%zu -> %d)",
@@ -634,6 +693,7 @@ void terraria_item_manager_init() {
   f_type = patchlib_type_get_field(item_class, "type");
   f_stack = patchlib_type_get_field(item_class, "stack");
   m_rebuild_tooltip = patchlib_type_get_method_by_param_count(item_class, "RebuildTooltip", 0);
+  TEKLOG_INFO("item: RebuildTooltip method=%p", m_rebuild_tooltip);
   m_reset_stats =
       patchlib_type_get_method_by_param_count(item_class, "ResetStats", 1);
   patch_handle_t set_defaults =
@@ -658,6 +718,13 @@ void terraria_item_manager_init() {
 
   patch_handle_t item_tooltip_cls = patchlib_type_get_type("Terraria.UI", "ItemTooltip");
   m_from_language_key = patchlib_type_get_method_by_param_count(item_tooltip_cls, "FromLanguageKey", 2);
+
+  // ---- 自定义物品常用字段/方法（存档等功能模块通过 get_item_ops 取用）----
+  f_item_prefix = patchlib_type_get_field(item_class, "prefix");
+  m_item_net_defaults =
+      patchlib_type_get_method_by_param_count(item_class, "netDefaults", 1);
+  m_item_prefix =
+      patchlib_type_get_method_by_param_count(item_class, "Prefix", 1);
 
   patchlib_free(item_tooltip_cls);
   patchlib_free(get_item_name);
@@ -717,7 +784,15 @@ bool terraria_item_manager_register_item(terraria_item_handle_t *item_handle) {
                item_handle->parent_modloader_id) == 0 &&
         strcmp((*existing)->parent_id, item_handle->parent_id) == 0 &&
         strcmp((*existing)->internal_name, item_handle->internal_name) == 0) {
-      return false; /* 重复注册 */
+      // 热重载：同一 Mod 再次注册同名物品。用新句柄替换旧句柄，并保留
+      // 已分配的 runtime_id。
+      item_handle->runtime_id = (*existing)->runtime_id;
+      *existing = item_handle;
+      TEKLOG_INFO("item re-registered (hot reload): %s.%s id=%d",
+                  item_handle->parent_id ? item_handle->parent_id : "?",
+                  item_handle->internal_name ? item_handle->internal_name : "?",
+                  item_handle->runtime_id);
+      return true;
     }
   }
 
@@ -959,6 +1034,105 @@ static void resize_array(const char *ns, const char *cls, const char *fid,
   patchlib_free(class_handle);
 }
 
+// 强制把 ItemID.Sets 中若干“按物品 type 索引、运行时会访问”的集合扩容到
+// new_size。与 resize_all_class_sets 不同：这里不要求旧长度恰好等于
+// ItemID.Count，只要旧长度 < new_size 就扩容。
+//
+// 背景：Main.UpdateWorld_Items 对每个 WorldItem.UpdateItem 做 try/catch，
+// 一旦自定义物品更新时抛 IndexOutOfRangeException，会被 Main.ignoreErrors
+// 静默吞掉并把该槽位换成空 WorldItem（表现为“掉落物存在一帧后消失”）。
+// WorldItem.UpdateItem 只会访问这些 ItemID.Sets 数组，因此在最终阶段再兜底
+// 强制扩一次，即使前面的批量扩容因静态构造时序/失败被跳过也能兜住。
+static void force_resize_itemid_set(const char *name, const int new_size) {
+  if (!name || new_size <= 0)
+    return;
+
+  patch_handle_t item_id_class =
+      patchlib_type_get_type("Terraria.ID", "ItemID");
+  if (!patchlib_is_valid(item_id_class)) {
+    TEKLOG_WARN("force_resize_itemid_set: ItemID not found");
+    return;
+  }
+  patch_handle_t sets_class =
+      patchlib_type_get_inner_type(item_id_class, "Sets");
+  patchlib_free(item_id_class);
+  if (!patchlib_is_valid(sets_class))
+    return;
+
+  patch_handle_t field = patchlib_type_get_field(sets_class, name);
+  if (!patchlib_is_valid(field)) {
+    patchlib_free(sets_class);
+    return;
+  }
+
+  patch_handle_t array = PATCH_NULL;
+  patchlib_field_get_value(field, NULL, &array);
+  if (patchlib_is_valid(array)) {
+    const size_t len = patchlib_array_length(array);
+    if (len > 0 && len < (size_t)new_size) {
+      patch_handle_t new_array =
+          patchlib_array_resize(array, (size_t)new_size, NULL);
+      if (patchlib_is_valid(new_array)) {
+        fill_new_slots_with_modal(array, new_array, len, (size_t)new_size);
+        patchlib_field_set_value(field, NULL, &new_array);
+        TEKLOG_INFO("force_resize_itemid_set: ✅ ItemID.Sets.%s (%zu -> %d)",
+                    name, len, new_size);
+        patchlib_free(new_array);
+      } else {
+        TEKLOG_ERROR("force_resize_itemid_set: failed to resize %s", name);
+      }
+    }
+    patchlib_free(array);
+  }
+
+  patchlib_free(field);
+  patchlib_free(sets_class);
+}
+
+// WorldItem.UpdateItem / 拾取 / 绘制路径上真正会被访问到的集合。
+static void force_resize_critical_item_sets(const int new_size) {
+  static const char *names[] = {
+      // WorldItem.UpdateItem
+      "ItemNoGravity",
+      "RecoverableImportantItem",
+      "IsLavaImmuneRegardlessOfRarity",
+      "BossBag",
+      "Torches",
+      "WaterTorches",
+      "CommonCoin",
+      "CanPassivelyStackInWorldOverride",
+      "OnlyNeedOneInInventoryOverride",
+      // 拾取 / 背包
+      "IsAPickup",
+      "IgnoresEncumberingStone",
+      "NebulaPickup",
+      "ItemsThatShouldNotBeInInventory",
+      // 绘制 / 贴图
+      "IsFood",
+      "AnimatesAsSoul",
+      "TrapSigned",
+      "DrawUnsafeIndicator",
+      "ItemIconPulse",
+      "TextureCopyLoad",
+      // Item.NewItem / DropSelectedItem
+      "IsAMaterial",
+      "OverflowProtectionTimeOffset",
+      "DropWithGrabDelayForAllPlayers",
+      "Deprecated",
+      // 曾被排除、但同样按物品 type 索引的集合
+      "CanBeQuickusedOnGamepad",
+      "OnlyNeedOneInInventoryOverride",
+      "CanPassivelyStackInWorldOverride",
+      "ForceConsumption",
+      "ForcesBreaksSleeping",
+      "LockOnAimCompensation",
+      "NetUseSoundSync",
+  };
+
+  for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i)
+    force_resize_itemid_set(names[i], new_size);
+}
+
 void terraria_item_manager_resize() {
   const int new_size = terraria_item_manager_get_count();
 
@@ -985,6 +1159,8 @@ void terraria_item_manager_resize() {
   resize_lang_caches(terraria_item_id_get_count(), new_size);
   // 护甲套装查询锯齿数组同步扩容（tooltip 生成路径）
   resize_armor_set_bonuses(terraria_item_id_get_count(), new_size);
+  // 兜底：强制扩容运行时物品更新/拾取/绘制会用到的 ItemID.Sets 集合
+  force_resize_critical_item_sets(new_size);
 
   patchlib_free(bool_type);
   patchlib_free(int_type);
@@ -1005,6 +1181,41 @@ terraria_item_handle_t* terraria_item_manager_get_item(int runtime_id) {
 
 tefstd_vector_t *terraria_item_manager_get_items() {
   return &g_terraria_item_registry;
+}
+
+void terraria_item_manager_get_item_ops(terraria_item_handles_t *out) {
+  if (!out)
+    return;
+  out->f_type = f_type;
+  out->f_stack = f_stack;
+  out->f_item_prefix = f_item_prefix;
+  out->m_net_defaults = m_item_net_defaults;
+  out->m_prefix = m_item_prefix;
+}
+
+terraria_item_handle_t *terraria_item_manager_find_item(const char *loader,
+                                                        const char *mod,
+                                                        const char *name) {
+  if (!loader || !mod || !name)
+    return NULL;
+  const size_t count = tefstd_vector_size(&g_terraria_item_registry);
+  for (size_t i = 0; i < count; ++i) {
+    terraria_item_handle_t **pp =
+        tefstd_vector_at(&g_terraria_item_registry, i);
+    if (!pp || !*pp)
+      continue;
+    terraria_item_handle_t *h = *pp;
+    if (h->parent_modloader_id && h->parent_id && h->internal_name &&
+        strcmp(h->parent_modloader_id, loader) == 0 &&
+        strcmp(h->parent_id, mod) == 0 &&
+        strcmp(h->internal_name, name) == 0)
+      return h;
+  }
+  return NULL;
+}
+
+terraria_item_handle_t *terraria_item_manager_unknown_item() {
+  return &unknown_item;
 }
 
 static char* generate_key(size_t key_size, const char* prefix, terraria_item_handle_t* current) {
