@@ -143,14 +143,12 @@ static void free_modloader(ml_handle_t* ml_handle) {
     }
 
     // 关闭包句柄
-    // ReSharper disable once CppDFANullDereference
-    if (ml_handle->ml_entry->pkg_handle) {
+    if (ml_handle->ml_entry && ml_handle->ml_entry->pkg_handle) {
         TEKLOG_DEBUG("Closing package handle");
-        // ReSharper disable once CppDFANullDereference
         tefpkg_close(ml_handle->ml_entry->pkg_handle);
-        // ReSharper disable once CppDFANullDereference
         ml_handle->ml_entry->pkg_handle = NULL;
     }
+
 
     // 释放句柄自身
     free(ml_handle);
@@ -426,7 +424,7 @@ void tefkernel_cleanup_all_ml(void) {
 
     // 反向遍历清理ModLoader
     for (size_t i = ml_count; i > 0; --i) {
-        ml_handle_t** ml_ptr = (ml_handle_t**)tefstd_vector_at(&g_ml_list, i - 1);
+        ml_handle_t** ml_ptr = tefstd_vector_at(&g_ml_list, i - 1);
         if (ml_ptr && *ml_ptr) {
             TEKLOG_DEBUG("Cleaning up modloader at index %zu", i - 1);
             ml_handle_t* ml_handle = *ml_ptr;

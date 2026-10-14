@@ -122,6 +122,7 @@ public static unsafe class Initialization
             RegisterApiMethod<DelegateIl2CppTypeGetType>(Class.il2cpp_type_get_type, "il2cpp_type_get_type");
             RegisterApiMethod<DelegateIl2CppTypeIsByref>(Class.il2cpp_type_is_byref, "il2cpp_type_is_byref");
             RegisterApiMethod<DelegateIl2cppClassValueSize>(Class.il2cpp_class_value_size, "il2cpp_class_value_size");
+            RegisterApiMethod<DelegateIl2cppObjectGetClass>(Class.il2cpp_object_get_class, "il2cpp_object_get_class");
         }
 
         // Delegates for Class API methods
@@ -189,6 +190,9 @@ public static unsafe class Initialization
         
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate int DelegateIl2cppClassValueSize(IntPtr typePtr, ref uint? align);
+        
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate IntPtr DelegateIl2cppObjectGetClass(IntPtr objPtr);
     }
 
     public static class MethodApi

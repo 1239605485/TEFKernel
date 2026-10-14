@@ -175,7 +175,7 @@ bool patchlib_method_invoke_args(patch_handle_t method, patch_handle_t instance,
 */
 
 bool patchlib_method_invoke_args(patch_handle_t method, patch_handle_t instance,
-                                void *return_value, void** args) {
+                                 void *return_value, void** args) {
     TEKLOG_DEBUG("patchlib_method_invoke_args called: method=%p, instance=%p, return_value=%p",
                  method, instance, return_value);
 
@@ -184,14 +184,12 @@ bool patchlib_method_invoke_args(patch_handle_t method, patch_handle_t instance,
         return false;
     }
 
-    // 获取方法签名
     patch_method_signature_t signature;
     if (!patchlib_method_get_signature(method, &signature)) {
         TEKLOG_ERROR("Failed to get method signature");
         return false;
     }
 
-    // 验证实例方法调用
     if (signature.is_instance && !patchlib_is_valid(instance)) {
         TEKLOG_ERROR("Instance method requires valid instance");
         patchlib_method_signature_free(&signature);
@@ -205,20 +203,23 @@ bool patchlib_method_invoke_args(patch_handle_t method, patch_handle_t instance,
         return false;
     }
 
-    // 计算总参数个数
+    /* ---------- 参数个数：explicit + this + MethodInfo ---------- */
     size_t explicit_arg_count = tefstd_vector_size(&signature.arg_types);
-    const int total_arg_count = (int)explicit_arg_count + (signature.is_instance ? 1 : 0);
+    const int total_arg_count =
+        (int)explicit_arg_count
+        + (signature.is_instance ? 1 : 0)
+        + 1;   /* ← 追加 MethodInfo* */
 
-    TEKLOG_DEBUG("Method invocation: ptr=%p, total_args=%d, is_instance=%s",
-                 method_ptr, total_arg_count, signature.is_instance ? "true" : "false");
+    TEKLOG_DEBUG("Method invocation: ptr=%p, explicit=%zu, total=%d (incl MethodInfo), is_instance=%s",
+                 method_ptr, explicit_arg_count, total_arg_count,
+                 signature.is_instance ? "true" : "false");
 
-    // 分配FFI参数数组（使用 RAII 风格，先分配再检查）
     ffi_type** arg_types = malloc(sizeof(ffi_type*) * total_arg_count);
-    void** arg_values = malloc(sizeof(void*) * total_arg_count);
+    void**     arg_values = malloc(sizeof(void*)   * total_arg_count);
 
     if (!arg_types || !arg_values) {
         TEKLOG_ERROR("Memory allocation failed for FFI arguments");
-        free(arg_types);   // free(NULL) 是安全的
+        free(arg_types);
         free(arg_values);
         patchlib_method_signature_free(&signature);
         return false;
@@ -226,19 +227,22 @@ bool patchlib_method_invoke_args(patch_handle_t method, patch_handle_t instance,
 
     int arg_index = 0;
 
-    // 设置this指针（如果是实例方法）
+    /* ---------- this ---------- */
     if (signature.is_instance) {
-        arg_types[arg_index] = &ffi_type_pointer;
+        arg_types[arg_index]  = &ffi_type_pointer;
         arg_values[arg_index] = &instance;
-        TEKLOG_DEBUG("Argument %d: this pointer=%p", arg_index, instance);
+        TEKLOG_DEBUG("Argument %d: this=%p", arg_index, instance);
         arg_index++;
     }
 
-    // 设置方法参数 - 添加边界检查
+    /* ---------- 显式参数 ---------- */
     if (args) {
         for (size_t i = 0; i < explicit_arg_count; i++) {
-            const patch_type_t* arg_type = tefstd_vector_at(&signature.arg_types, i);
-            patch_handle_t* arg_type_handle = tefstd_vector_at(&signature.arg_type_handles, i);
+            const patch_type_t* arg_type =
+                tefstd_vector_at(&signature.arg_types, i);
+            patch_handle_t* arg_type_handle =
+                tefstd_vector_at(&signature.arg_type_handles, i);
+
             if (!arg_type) {
                 TEKLOG_ERROR("Failed to get argument type at index %zu", i);
                 free(arg_values);
@@ -247,26 +251,40 @@ bool patchlib_method_invoke_args(patch_handle_t method, patch_handle_t instance,
                 return false;
             }
 
-            arg_types[arg_index] = patch_type_to_ffi_type(*arg_type, *arg_type_handle);
-            arg_values[arg_index] = args[i];  // args 应该有 explicit_arg_count 个元素
-            TEKLOG_DEBUG("Argument %d: type=%d, value=%p", arg_index, *arg_type, arg_values[arg_index]);
+            arg_types[arg_index]  = patch_type_to_ffi_type(*arg_type,
+                                    arg_type_handle ? *arg_type_handle : NULL);
+            arg_values[arg_index] = args[i];
+            TEKLOG_DEBUG("Argument %d: type=%d value=%p",
+                         arg_index, *arg_type, arg_values[arg_index]);
             arg_index++;
         }
     } else {
-        // args 为 NULL，所有参数传 NULL
         for (size_t i = 0; i < explicit_arg_count; i++) {
-            const patch_type_t* arg_type = tefstd_vector_at(&signature.arg_types, i);
-            patch_handle_t* arg_type_handle = tefstd_vector_at(&signature.arg_type_handles, i);
-            arg_types[arg_index] = patch_type_to_ffi_type(*arg_type, *arg_type_handle);
+            const patch_type_t* arg_type =
+                tefstd_vector_at(&signature.arg_types, i);
+            patch_handle_t* arg_type_handle =
+                tefstd_vector_at(&signature.arg_type_handles, i);
+
+            arg_types[arg_index]  = patch_type_to_ffi_type(*arg_type,
+                                    arg_type_handle ? *arg_type_handle : NULL);
             arg_values[arg_index] = NULL;
-            TEKLOG_DEBUG("Argument %d: type=%d, value=NULL", arg_index, *arg_type);
+            TEKLOG_DEBUG("Argument %d: type=%d value=NULL", arg_index, *arg_type);
             arg_index++;
         }
     }
 
-    // 准备FFI调用
-    ffi_cif cif;
-    ffi_type* return_ffi_type = patch_type_to_ffi_type(signature.return_type, signature.return_type_handle);
+    /* ---------- MethodInfo* （最后一个隐藏参数） ---------- */
+    arg_types[arg_index]  = &ffi_type_pointer;
+    /* 注意：ffi 需要的是"指向参数值"的地址。
+       对指针类型参数，值就是 method 句柄本身；
+       所以这里要传 &method，而不是 method。 */
+    arg_values[arg_index] = &method;
+    TEKLOG_DEBUG("Argument %d: MethodInfo*=%p", arg_index, method);
+    arg_index++;
+
+    /* ---------- 返回类型 ---------- */
+    ffi_type* return_ffi_type =
+        patch_type_to_ffi_type(signature.return_type, signature.return_type_handle);
     if (!return_ffi_type) {
         TEKLOG_ERROR("Invalid return type");
         free(arg_values);
@@ -278,17 +296,14 @@ bool patchlib_method_invoke_args(patch_handle_t method, patch_handle_t instance,
     ffi_abi abi = FFI_DEFAULT_ABI;
 #if defined(__aarch64__)
     abi = FFI_SYSV;
-    TEKLOG_DEBUG("Using FFI_SYSV ABI for ARM64");
 #elif defined(__arm__)
     abi = FFI_SYSV;
-    TEKLOG_DEBUG("Using FFI_SYSV ABI for ARM32");
-#else
-    TEKLOG_DEBUG("Using FFI_DEFAULT_ABI");
 #endif
 
-    TEKLOG_DEBUG("Preparing FFI CIF: abi=%d, nargs=%d", abi, total_arg_count);
-
-    ffi_status status = ffi_prep_cif(&cif, abi, (unsigned int)total_arg_count, return_ffi_type, arg_types);
+    ffi_cif cif;
+    ffi_status status = ffi_prep_cif(&cif, abi,
+                                     (unsigned int)total_arg_count,
+                                     return_ffi_type, arg_types);
     if (status != FFI_OK) {
         TEKLOG_ERROR("FFI CIF preparation failed: %d", status);
         free(arg_values);
@@ -297,21 +312,19 @@ bool patchlib_method_invoke_args(patch_handle_t method, patch_handle_t instance,
         return false;
     }
 
-    TEKLOG_DEBUG("Calling method via FFI");
-
-    // 调用方法
+    TEKLOG_DEBUG("Calling method via FFI (nargs=%d)", total_arg_count);
     ffi_call(&cif, FFI_FN(method_ptr), return_value, arg_values);
-
     TEKLOG_DEBUG("Method invocation completed successfully");
 
-    // 释放每个参数的 ffi_type（只对动态分配的 PATCH_STRUCT 生效）
+    /* ---------- 释放 ffi_type ---------- */
     for (size_t i = 0; i < total_arg_count; i++) {
-        patch_handle_t *h = tefstd_vector_at(&signature.arg_type_handles, i);
-        if (h && arg_types[i])
-            patch_ffi_type_free(arg_types[i], *h);
+        /* 只对显式参数释放；this/MethodInfo 都是 ffi_type_pointer，无需释放 */
+        if (i < explicit_arg_count) {
+            patch_handle_t *h = tefstd_vector_at(&signature.arg_type_handles, i);
+            if (h && arg_types[i])
+                patch_ffi_type_free(arg_types[i], *h);
+        }
     }
-
-    // 释放返回类型的 ffi_type
     if (return_ffi_type) {
         patch_ffi_type_free(return_ffi_type, signature.return_type_handle);
     }

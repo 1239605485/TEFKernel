@@ -668,4 +668,12 @@ public static class Class
         var type = (Type)typeHandle.Target;
         return type.IsByRef;
     }
+    
+    public static IntPtr il2cpp_object_get_class(IntPtr objPtr) {
+        var handle = GCHandle.FromIntPtr(objPtr);
+        var obj = handle.Target;
+        var type = obj.GetType();
+        var typeHandle = GCHandle.Alloc(type);
+        return GCHandle.ToIntPtr(typeHandle);
+    }
 }

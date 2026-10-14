@@ -115,8 +115,18 @@ void il2cpp_api_init(void *handle) {
     LOAD_SYMBOL(il2cpp_thread_detach);
 }
 
+typedef struct il2cpp_object
+{
+    union
+    {
+        void *klass;
+        void *vtable;
+    };
+    void *monitor;
+} il2cpp_object;
+
 void * il2cpp_object_get_class(void *object) {
-    return *(void**)object;
+    return ((il2cpp_object*)object)->klass;
 }
 
 /*

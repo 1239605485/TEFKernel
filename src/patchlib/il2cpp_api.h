@@ -75,17 +75,6 @@ typedef enum il2cpp_type_enum_t {
     IL2CPP_TYPE_ENUM = 0x55
 } il2cpp_type_enum_t;
 
-#if defined(__ANDROID__)
-/**
- * @brief 从对象获取类
- * @param object 对象
- * @return 返回结果
- */
-void *il2cpp_object_get_class(void *object);
-#else
-#define il2cpp_object_get_class(object) object
-#endif
-
 #ifndef IL2CPP_API_IMPL
 #define IL2CPP_API_IMPL 0
 #endif
@@ -121,6 +110,18 @@ DEFINE_IL2CPP_API(int, il2cpp_init, const char* domain_name)
  */
 DEFINE_IL2CPP_API(void*, il2cpp_array_new_specific, void* array_type_info, uintptr_t length)
 #endif
+
+#if defined(__ANDROID__)
+/**
+ * @brief 从对象获取类
+ * @param object 对象
+ * @return 返回结果
+ */
+void *il2cpp_object_get_class(void *object);
+#else
+DEFINE_IL2CPP_API(void*, il2cpp_object_get_class, void* object)
+#endif
+
 
 /**
  * @brief 获取当前应用域

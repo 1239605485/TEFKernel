@@ -89,6 +89,7 @@ typedef struct terraria_item_handle_t {
     const char* parent_id; //<< 所属mod id
     const char* internal_name; //<< 内部名称
     bool has_tooltip; //<< 是否存在物品介绍
+    int sacrifice_count; //<< 研究所需数量
     int runtime_id;  //<< 由内核分配
 
     terraria_item_ops_t item_ops; //<< 内部逻辑
