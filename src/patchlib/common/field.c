@@ -180,7 +180,13 @@ patch_handle_t patchlib_field_get_type_handle(patch_handle_t field) {
         TEKLOG_WARN("Invalid field handle");
         return PATCH_NULL;
     }
-    return il2cpp_field_get_type(field);
+    patch_handle_t type = il2cpp_field_get_type(field);
+    if (!patchlib_is_valid(type))
+        return PATCH_NULL;
+    // Android: il2cpp_field_get_type 返回 Il2CppType*，需转成 Il2CppClass*
+    // 才能用于 il2cpp_class_get_method_from_name 等类型 API；
+    // 桌面端 il2cpp_class_from_type 是恒等宏，直接返回即可。
+    return il2cpp_class_from_type(type);
 }
 
 size_t patchlib_field_get_size(patch_handle_t field) {

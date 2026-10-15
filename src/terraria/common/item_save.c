@@ -125,6 +125,13 @@ static patch_handle_t resolve_container_array(const char *tag,
   const bool is_chest = strcmp(tag, "bank") == 0 || strcmp(tag, "bank2") == 0 ||
                         strcmp(tag, "bank3") == 0 || strcmp(tag, "bank4") == 0;
 
+#if defined(__ANDROID__)
+  // 移动端 Chest.item 是 ChestItem[]（紧凑结构），不是 Item[]，
+  // 按 Item* 读取会得到野指针。这里先跳过猪猪/银行容器。
+  if (is_chest)
+    return PATCH_NULL;
+#endif
+
   if (strcmp(tag, "inv") == 0)
     field = f_player_inventory;
   else if (strcmp(tag, "misc") == 0)
@@ -408,6 +415,10 @@ static char *world_tef_base() {
 }
 
 static void save_world_chests() {
+#if defined(__ANDROID__)
+  // 移动端 Chest.item 是 ChestItem[]，暂不支持稳定键存档，跳过。
+  return;
+#endif
   if (!patchlib_is_valid(f_main_chest) || !patchlib_is_valid(f_chest_item))
     return;
 
@@ -470,6 +481,9 @@ static void save_world_chests() {
 }
 
 static void load_world_chests() {
+#if defined(__ANDROID__)
+  return;
+#endif
   if (!patchlib_is_valid(f_main_chest) || !patchlib_is_valid(f_chest_item))
     return;
 

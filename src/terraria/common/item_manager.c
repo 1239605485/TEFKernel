@@ -360,31 +360,6 @@ static void content_samples_initialize_postfix(patch_handle_t this, void **args,
     patch_handle_t m_ctor =
             patchlib_type_get_method_by_param_count(item_type, ".ctor", 2);
 
-    /* ---------- ItemID.Search（ReLogic.Reflection.IdDictionary）------- */
-    // 原版 ContentSamples 用 ItemID.Search.GetName(type) 记录持久化名，而
-    // IdDictionary.GetName 对未知 id 会抛异常。把自定义物品也注册进去，避免
-    // 创造菜单/调试模拟等路径在按名反查时崩溃。
-    patch_handle_t item_id_cls = patchlib_type_get_type("Terraria.ID", "ItemID");
-    patch_handle_t f_search = PATCH_NULL;
-    patch_handle_t search_dict = PATCH_NULL;
-    patch_handle_t m_search_add = PATCH_NULL;
-    patch_handle_t m_search_contains = PATCH_NULL;
-    if (patchlib_is_valid(item_id_cls)) {
-        f_search = patchlib_type_get_field(item_id_cls, "Search");
-        if (patchlib_is_valid(f_search))
-            patchlib_field_get_value(f_search, PATCH_NULL, &search_dict);
-        patch_handle_t id_dict_cls =
-                patchlib_type_get_type("ReLogic.Reflection", "IdDictionary");
-        if (patchlib_is_valid(id_dict_cls)) {
-            m_search_add = patchlib_type_get_method(id_dict_cls, "Add");
-            // 用 ContainsName 而不是 TryGetId：后者带 out 参数（byref），
-            // loader 的 GetNativeValue 无法正确 marshalling byref，会崩。
-            m_search_contains =
-                    patchlib_type_get_method(id_dict_cls, "ContainsName");
-            patchlib_free(id_dict_cls);
-        }
-    }
-
     /* ---------- 遍历所有自定义物品 ---------- */
     const size_t custom_count = tefstd_vector_size(&g_terraria_item_registry);
     int registered = 0;
@@ -439,20 +414,6 @@ static void content_samples_initialize_postfix(patch_handle_t this, void **args,
                                                      t_persist_ids, &item_id,
                                                      &str_obj))
                 TEKLOG_WARN("PersistIds set failed: id=%d", item_id);
-
-            /* ----- ItemID.Search.Add(persist_id, item_id)（去重）----- */
-            if (patchlib_is_valid(search_dict) && patchlib_is_valid(m_search_add) &&
-                patchlib_is_valid(m_search_contains)) {
-                bool exists = false;
-                void *cargs[1] = {&str_obj};
-                patchlib_method_invoke_args(m_search_contains, search_dict,
-                                            &exists, cargs);
-                if (!exists) {
-                    void *aargs[2] = {&str_obj, &item_id};
-                    patchlib_method_invoke_args(m_search_add, search_dict, NULL,
-                                                aargs);
-                }
-            }
         }
 
         /* 释放本轮创建的临时句柄（字典已持有 item/str 的引用） */
@@ -474,12 +435,6 @@ static void content_samples_initialize_postfix(patch_handle_t this, void **args,
     patchlib_free(m_ctor);
     patchlib_free(item_type);
     patchlib_free(cs_type);
-
-    patchlib_free(m_search_add);
-    patchlib_free(m_search_contains);
-    patchlib_free(search_dict);
-    patchlib_free(f_search);
-    patchlib_free(item_id_cls);
 
     patchlib_free(dict_by_type);
     patchlib_free(dict_net_ids);
