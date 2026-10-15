@@ -31,8 +31,6 @@
 #ifndef TEFKERNEL_ITEM_MANAGER_H
 #define TEFKERNEL_ITEM_MANAGER_H
 
-#if IS_TEFKERNEL_BUILD
-
 #include <stdbool.h>
 
 #include "../tef_api.h"
@@ -126,6 +124,5 @@ DEFINE_FUNCTION(tefstd_vector_t*, terraria_item_manager_get_items)
 
 #ifdef __cplusplus
 }
-#endif
 #endif
 #endif //TEFKERNEL_ITEM_MANAGER_H

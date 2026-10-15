@@ -175,6 +175,14 @@ patch_type_t patchlib_field_get_type(patch_handle_t field) {
     return result;
 }
 
+patch_handle_t patchlib_field_get_type_handle(patch_handle_t field) {
+    if (!patchlib_is_valid(field)) {
+        TEKLOG_WARN("Invalid field handle");
+        return PATCH_NULL;
+    }
+    return il2cpp_field_get_type(field);
+}
+
 size_t patchlib_field_get_size(patch_handle_t field) {
     if (!patchlib_is_valid(field)) {
         TEKLOG_WARN("Invalid field handle");
