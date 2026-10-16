@@ -1163,7 +1163,17 @@ void terraria_item_manager_init() {
     }
 
     patch_handle_t item_tooltip_cls = patchlib_type_get_type("Terraria.UI", "ItemTooltip");
-    m_from_language_key = patchlib_type_get_method_by_param_count(item_tooltip_cls, "FromLanguageKey", 1);
+    // 两端签名不同：
+    //   桌面  FromLanguageKey(string key)              → 1 参
+    //   手机  FromLanguageKey(short id, string key)    → 2 参（见 dump/ItemTooltip/FromLanguageKey.txt）
+    m_from_language_key = patchlib_type_get_method_by_param_count(
+            item_tooltip_cls, "FromLanguageKey",
+#if __ANDROID__
+            2
+#else
+            1
+#endif
+    );
 
     // ---- 自定义物品常用字段/方法（存档等功能模块通过 get_item_ops 取用）----
     f_item_prefix = patchlib_type_get_field(item_class, "prefix");
@@ -1819,19 +1829,18 @@ void terraria_item_manager_init_localized_text() {
             // 的分隔符共 3 个，"item_tooltip" 长度为 12，故基数应为 12+3+1=16。
             char *item_tooltip_key_buffer = generate_key(16, "item_tooltip", current);
 
-            // ItemTooltip.FromLanguageKey(string key)：参数是“字符串键”，
-            // 不是 LocalizedText（1.4.5.8 里只有 1 个 string 参数）。
+            // ItemTooltip.FromLanguageKey：桌面为 (string key)；手机为 (short id, string key)。
             patch_handle_t item_tooltip_key_str =
                     patchlib_string_create(item_tooltip_key_buffer);
             patch_handle_t item_tooltip = PATCH_NULL;
 
 #if __ANDROID__
-            item_tooltip = ((void*(*)(void *)) patchlib_method_get_pointer(m_from_language_key))(
-                item_tooltip_key_str);
+            int16_t tooltip_id = (int16_t) target_index;
+            void *args[2] = {&tooltip_id, &item_tooltip_key_str};
 #else
             void *args[1] = {&item_tooltip_key_str};
-            patchlib_method_invoke_args(m_from_language_key, NULL, &item_tooltip, args);
 #endif
+            patchlib_method_invoke_args(m_from_language_key, NULL, &item_tooltip, args);
 
             if (patchlib_is_valid(item_tooltip))
                 patchlib_array_set(array_item_tooltip_cache, target_index, &item_tooltip);
