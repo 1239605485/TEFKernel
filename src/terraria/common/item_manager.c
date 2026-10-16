@@ -360,6 +360,42 @@ static void content_samples_initialize_postfix(patch_handle_t this, void **args,
     patch_handle_t m_ctor =
             patchlib_type_get_method_by_param_count(item_type, ".ctor", 2);
 
+    /* ---------- ItemID.Search（ReLogic.Reflection.IdDictionary）-------
+     * 不调用 IdDictionary.Add：移动端用 libffi 调它会在 libil2cpp 崩溃。
+     * 改为直接写它的两个内部字典 _nameToId / _idToName（set_Item 路径已验证可用）。*/
+    patch_handle_t item_id_cls = patchlib_type_get_type("Terraria.ID", "ItemID");
+    patch_handle_t f_search = PATCH_NULL;
+    patch_handle_t search_dict = PATCH_NULL;
+    patch_handle_t f_name_to_id = PATCH_NULL;
+    patch_handle_t f_id_to_name = PATCH_NULL;
+    patch_handle_t dict_name_to_id = PATCH_NULL; // Dictionary<string,int>
+    patch_handle_t dict_id_to_name = PATCH_NULL; // Dictionary<int,string>
+    patch_handle_t t_name_to_id = PATCH_NULL;
+    patch_handle_t t_id_to_name = PATCH_NULL;
+    if (patchlib_is_valid(item_id_cls)) {
+        f_search = patchlib_type_get_field(item_id_cls, "Search");
+        if (patchlib_is_valid(f_search))
+            patchlib_field_get_value(f_search, PATCH_NULL, &search_dict);
+
+        patch_handle_t id_dict_cls =
+                patchlib_type_get_type("ReLogic.Reflection", "IdDictionary");
+        if (patchlib_is_valid(id_dict_cls)) {
+            f_name_to_id = patchlib_type_get_field(id_dict_cls, "_nameToId");
+            f_id_to_name = patchlib_type_get_field(id_dict_cls, "_idToName");
+            if (patchlib_is_valid(f_name_to_id))
+                t_name_to_id = patchlib_field_get_type_handle(f_name_to_id);
+            if (patchlib_is_valid(f_id_to_name))
+                t_id_to_name = patchlib_field_get_type_handle(f_id_to_name);
+            patchlib_free(id_dict_cls);
+        }
+        if (patchlib_is_valid(search_dict)) {
+            if (patchlib_is_valid(f_name_to_id))
+                patchlib_field_get_value(f_name_to_id, search_dict, &dict_name_to_id);
+            if (patchlib_is_valid(f_id_to_name))
+                patchlib_field_get_value(f_id_to_name, search_dict, &dict_id_to_name);
+        }
+    }
+
     /* ---------- 遍历所有自定义物品 ---------- */
     const size_t custom_count = tefstd_vector_size(&g_terraria_item_registry);
     int registered = 0;
@@ -414,6 +450,22 @@ static void content_samples_initialize_postfix(patch_handle_t this, void **args,
                                                      t_persist_ids, &item_id,
                                                      &str_obj))
                 TEKLOG_WARN("PersistIds set failed: id=%d", item_id);
+
+            /* ----- ItemID.Search 内部字典：name->id / id->name ----- */
+            if (patchlib_is_valid(dict_name_to_id) &&
+                patchlib_is_valid(t_name_to_id)) {
+                if (!patchlib_dictionary_set_value_typed(dict_name_to_id,
+                                                         t_name_to_id, &str_obj,
+                                                         &item_id))
+                    TEKLOG_WARN("Search nameToId set failed: id=%d", item_id);
+            }
+            if (patchlib_is_valid(dict_id_to_name) &&
+                patchlib_is_valid(t_id_to_name)) {
+                if (!patchlib_dictionary_set_value_typed(dict_id_to_name,
+                                                         t_id_to_name, &item_id,
+                                                         &str_obj))
+                    TEKLOG_WARN("Search idToName set failed: id=%d", item_id);
+            }
         }
 
         /* 释放本轮创建的临时句柄（字典已持有 item/str 的引用） */
@@ -435,6 +487,16 @@ static void content_samples_initialize_postfix(patch_handle_t this, void **args,
     patchlib_free(m_ctor);
     patchlib_free(item_type);
     patchlib_free(cs_type);
+
+    patchlib_free(dict_name_to_id);
+    patchlib_free(dict_id_to_name);
+    patchlib_free(t_name_to_id);
+    patchlib_free(t_id_to_name);
+    patchlib_free(search_dict);
+    patchlib_free(f_name_to_id);
+    patchlib_free(f_id_to_name);
+    patchlib_free(f_search);
+    patchlib_free(item_id_cls);
 
     patchlib_free(dict_by_type);
     patchlib_free(dict_net_ids);

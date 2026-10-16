@@ -65,6 +65,10 @@ static patch_handle_t m_pfd_get_player = PATCH_NULL;  // PlayerFileData.get_Play
 static patch_handle_t m_file_get_path = PATCH_NULL;   // FileData.get_Path()（Player/World 通用）
 static patch_handle_t f_main_chest = PATCH_NULL;      // Main.chest (Chest[])
 static patch_handle_t f_main_active_world = PATCH_NULL; // Main.ActiveWorldFileData (WorldFileData)
+// 移动端 Chest.item 是 ChestItem[]，用以下句柄把槽位与 Item 互转
+static patch_handle_t m_item_ctor = PATCH_NULL;          // Item(int, ItemVariant)
+static patch_handle_t m_chestitem_expand = PATCH_NULL;   // ChestItem.ExpandItem() -> Item
+static patch_handle_t m_chestitem_set_to_item = PATCH_NULL; // ChestItem.SetToItem(Item)
 
 // ------------------------------------------------------------------
 // 路径与文件
@@ -118,19 +122,16 @@ static const char *g_container_tags[] = {
     "inv",   "misc", "miscdye", "armor", "dye",
     "bank",  "bank2", "bank3",  "bank4"};
 
-// 按标签解析出对应的 Item[]（bank* 需要先取 Chest 实例再取 Chest.item）。
+// 按标签解析出对应的容器数组（bank* 需要先取 Chest 实例再取 Chest.item）。
+// out_is_chest 输出该容器是否为 Chest（移动端其 .item 是 ChestItem[]）。
 static patch_handle_t resolve_container_array(const char *tag,
-                                              patch_handle_t player) {
+                                              patch_handle_t player,
+                                              bool *out_is_chest) {
   patch_handle_t field = PATCH_NULL;
   const bool is_chest = strcmp(tag, "bank") == 0 || strcmp(tag, "bank2") == 0 ||
                         strcmp(tag, "bank3") == 0 || strcmp(tag, "bank4") == 0;
-
-#if defined(__ANDROID__)
-  // 移动端 Chest.item 是 ChestItem[]（紧凑结构），不是 Item[]，
-  // 按 Item* 读取会得到野指针。这里先跳过猪猪/银行容器。
-  if (is_chest)
-    return PATCH_NULL;
-#endif
+  if (out_is_chest)
+    *out_is_chest = is_chest;
 
   if (strcmp(tag, "inv") == 0)
     field = f_player_inventory;
@@ -172,6 +173,75 @@ static patch_handle_t resolve_container_array(const char *tag,
   return arr;
 }
 
+// 取某槽位的 Item（非拥有引用，勿释放）。
+// 移动端 Chest 的槽位是 ChestItem，用 ExpandItem() 转成 Item；其余平台/容器直接读 Item。
+static patch_handle_t container_get_item(patch_handle_t arr, size_t i,
+                                         bool is_chest) {
+#if defined(__ANDROID__)
+  if (is_chest && patchlib_is_valid(m_chestitem_expand)) {
+    unsigned char buf[256];
+    memset(buf, 0, sizeof(buf));
+    if (!patchlib_array_at(arr, i, buf))
+      return PATCH_NULL;
+    patch_handle_t item = PATCH_NULL;
+    patchlib_method_invoke_args(m_chestitem_expand, buf, &item, NULL);
+    return item;
+  }
+#else
+  (void)is_chest;
+#endif
+  patch_handle_t item = PATCH_NULL;
+  if (!patchlib_array_at(arr, i, &item))
+    return PATCH_NULL;
+  return item;
+}
+
+// 把某槽位设为自定义物品（移动端 Chest 槽位需 SetToItem 回写）。
+static void container_set_custom(patch_handle_t arr, size_t slot, bool is_chest,
+                                 int id, int stack, int prefix) {
+#if defined(__ANDROID__)
+  if (is_chest) {
+    if (!patchlib_is_valid(m_item_ctor) ||
+        !patchlib_is_valid(m_chestitem_set_to_item))
+      return;
+    patch_handle_t item = PATCH_NULL;
+    patch_handle_t variant = PATCH_NULL;
+    void *ca[2] = {&id, &variant};
+    patchlib_constructor_invoke(m_item_ctor, &item, ca);
+    if (!patchlib_is_valid(item))
+      return;
+    if (stack > 0)
+      patchlib_field_set_value(g_ops.f_stack, item, &stack);
+    if (prefix > 0 && patchlib_is_valid(g_ops.m_prefix)) {
+      void *pa[1] = {&prefix};
+      patchlib_method_invoke_args(g_ops.m_prefix, item, NULL, pa);
+    }
+    unsigned char buf[256];
+    memset(buf, 0, sizeof(buf));
+    if (!patchlib_array_at(arr, slot, buf))
+      return;
+    void *sa[1] = {&item};
+    patchlib_method_invoke_args(m_chestitem_set_to_item, buf, NULL, sa);
+    patchlib_array_set(arr, slot, buf);
+    return;
+  }
+#else
+  (void)is_chest;
+#endif
+  patch_handle_t item = PATCH_NULL;
+  if (!patchlib_array_at(arr, slot, &item) || !patchlib_is_valid(item))
+    return;
+  int iid = id;
+  void *a1[1] = {&iid};
+  patchlib_method_invoke_args(g_ops.m_net_defaults, item, NULL, a1);
+  if (stack > 0)
+    patchlib_field_set_value(g_ops.f_stack, item, &stack);
+  if (prefix > 0 && patchlib_is_valid(g_ops.m_prefix)) {
+    void *pa[1] = {&prefix};
+    patchlib_method_invoke_args(g_ops.m_prefix, item, NULL, pa);
+  }
+}
+
 // 当某个槽位里的物品是“自定义物品”时，把它的稳定键写出一行；返回是否写出。
 static bool write_custom_item_line(FILE *f, const size_t a, const size_t b,
                                    patch_handle_t item) {
@@ -205,8 +275,9 @@ static bool write_custom_item_line(FILE *f, const size_t a, const size_t b,
   return true;
 }
 
-// 把玩家某个 Item[] 容器里的自定义物品写进文件，返回写入条数
-static int save_one_container(FILE *f, const char *tag, patch_handle_t arr) {
+// 把玩家某个容器里的自定义物品写进文件，返回写入条数
+static int save_one_container(FILE *f, const char *tag, patch_handle_t arr,
+                              bool is_chest) {
   if (!patchlib_is_valid(arr))
     return 0;
 
@@ -214,8 +285,8 @@ static int save_one_container(FILE *f, const char *tag, patch_handle_t arr) {
   int saved = 0;
 
   for (size_t i = 0; i < len; ++i) {
-    patch_handle_t item = PATCH_NULL;
-    if (!patchlib_array_at(arr, i, &item) || !patchlib_is_valid(item))
+    patch_handle_t item = container_get_item(arr, i, is_chest);
+    if (!patchlib_is_valid(item))
       continue;
 
     // 行格式：tag slot loader mod name stack prefix
@@ -278,9 +349,11 @@ static void save_player_items(patch_handle_t player, patch_handle_t pfd) {
   int saved = 0;
   for (size_t t = 0;
        t < sizeof(g_container_tags) / sizeof(g_container_tags[0]); ++t) {
-    patch_handle_t arr = resolve_container_array(g_container_tags[t], player);
+    bool is_chest = false;
+    patch_handle_t arr =
+        resolve_container_array(g_container_tags[t], player, &is_chest);
     if (patchlib_is_valid(arr)) {
-      saved += save_one_container(f, g_container_tags[t], arr);
+      saved += save_one_container(f, g_container_tags[t], arr, is_chest);
       patchlib_free(arr);
     }
   }
@@ -319,7 +392,8 @@ static void load_player_items(patch_handle_t player, patch_handle_t pfd) {
                tag, &slot, loader, mod, item_name, &stack, &prefix) != 7)
       continue;
 
-    patch_handle_t arr = resolve_container_array(tag, player);
+    bool is_chest = false;
+    patch_handle_t arr = resolve_container_array(tag, player, &is_chest);
     if (!patchlib_is_valid(arr))
       continue;
 
@@ -342,23 +416,8 @@ static void load_player_items(patch_handle_t player, patch_handle_t pfd) {
       continue;
     }
 
-    patch_handle_t item = PATCH_NULL;
-    if (!patchlib_array_at(arr, slot, &item) || !patchlib_is_valid(item)) {
-      patchlib_free(arr);
-      continue;
-    }
-
-    // netDefaults(runtime_id) 会触发 set_defaults_postfix，套用自定义默认值
-    int id = h->runtime_id;
-    void *args1[1] = {&id};
-    patchlib_method_invoke_args(g_ops.m_net_defaults, item, NULL, args1);
-
-    if (stack > 0)
-      patchlib_field_set_value(g_ops.f_stack, item, &stack);
-    if (prefix > 0 && patchlib_is_valid(g_ops.m_prefix)) {
-      void *pa[1] = {&prefix};
-      patchlib_method_invoke_args(g_ops.m_prefix, item, NULL, pa);
-    }
+    // netDefaults/createItem 会触发 set_defaults_postfix，套用自定义默认值
+    container_set_custom(arr, slot, is_chest, h->runtime_id, stack, prefix);
     restored++;
     patchlib_free(arr);
   }
@@ -415,10 +474,6 @@ static char *world_tef_base() {
 }
 
 static void save_world_chests() {
-#if defined(__ANDROID__)
-  // 移动端 Chest.item 是 ChestItem[]，暂不支持稳定键存档，跳过。
-  return;
-#endif
   if (!patchlib_is_valid(f_main_chest) || !patchlib_is_valid(f_chest_item))
     return;
 
@@ -462,8 +517,8 @@ static void save_world_chests() {
         if (max_items > 0 && (size_t)max_items < lim)
           lim = (size_t)max_items;
         for (size_t si = 0; si < lim; ++si) {
-          patch_handle_t item = PATCH_NULL;
-          if (!patchlib_array_at(items, si, &item) || !patchlib_is_valid(item))
+          patch_handle_t item = container_get_item(items, si, true);
+          if (!patchlib_is_valid(item))
             continue;
           if (write_custom_item_line(f, ci, si, item))
             saved++;
@@ -481,9 +536,6 @@ static void save_world_chests() {
 }
 
 static void load_world_chests() {
-#if defined(__ANDROID__)
-  return;
-#endif
   if (!patchlib_is_valid(f_main_chest) || !patchlib_is_valid(f_chest_item))
     return;
 
@@ -534,13 +586,6 @@ static void load_world_chests() {
       continue;
     }
 
-    patch_handle_t item = PATCH_NULL;
-    if (!patchlib_array_at(items, slot, &item) || !patchlib_is_valid(item)) {
-      patchlib_free(items);
-      patchlib_free(chest);
-      continue;
-    }
-
     terraria_item_handle_t *h =
         terraria_item_manager_find_item(loader, mod, item_name);
     if (!h || h->runtime_id < 0) {
@@ -554,16 +599,7 @@ static void load_world_chests() {
       continue;
     }
 
-    int id = h->runtime_id;
-    void *args1[1] = {&id};
-    patchlib_method_invoke_args(g_ops.m_net_defaults, item, NULL, args1);
-
-    if (stack > 0)
-      patchlib_field_set_value(g_ops.f_stack, item, &stack);
-    if (prefix > 0 && patchlib_is_valid(g_ops.m_prefix)) {
-      void *pa[1] = {&prefix};
-      patchlib_method_invoke_args(g_ops.m_prefix, item, NULL, pa);
-    }
+    container_set_custom(items, slot, true, h->runtime_id, stack, prefix);
     restored++;
 
     patchlib_free(items);
@@ -623,6 +659,22 @@ void terraria_item_save_init() {
     f_chest_item = patchlib_type_get_field(chest_class, "item");
     f_chest_max_items = patchlib_type_get_field(chest_class, "maxItems");
     patchlib_free(chest_class);
+  }
+
+  // 移动端：ChestItem <-> Item 转换 + Item 构造
+  patch_handle_t item_class = patchlib_type_get_type("Terraria", "Item");
+  if (patchlib_is_valid(item_class)) {
+    m_item_ctor = patchlib_type_get_method_by_param_count(item_class, ".ctor", 2);
+    patchlib_free(item_class);
+  }
+  patch_handle_t chestitem_class =
+      patchlib_type_get_type("Terraria", "ChestItem");
+  if (patchlib_is_valid(chestitem_class)) {
+    m_chestitem_expand =
+        patchlib_type_get_method_by_param_count(chestitem_class, "ExpandItem", 0);
+    m_chestitem_set_to_item =
+        patchlib_type_get_method_by_param_count(chestitem_class, "SetToItem", 1);
+    patchlib_free(chestitem_class);
   }
 
   // FileData.get_Path()（PlayerFileData / WorldFileData 共用）
