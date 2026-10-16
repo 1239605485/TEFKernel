@@ -92,7 +92,9 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake make gcc-mingw-w64-i686 g++-mingw-w64-i686
+          sudo apt-get install -y cmake make gcc-mingw-w64-i686-posix g++-mingw-w64-i686-posix
+          sudo update-alternatives --set i686-w64-mingw32-gcc /usr/bin/i686-w64-mingw32-gcc-posix
+          sudo update-alternatives --set i686-w64-mingw32-g++ /usr/bin/i686-w64-mingw32-g++-posix
 
       - name: Configure
         run: cmake --preset ci-windows-x86-${{ matrix.build_type }}
