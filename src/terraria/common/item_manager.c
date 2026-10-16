@@ -34,6 +34,7 @@
 #include "patchlib/method.h"
 #include "patchlib/struct/array.h"
 #include "patchlib/struct/dictionary.h"
+#include "patchlib/struct/list.h"
 #include "patchlib/struct/string.h"
 #include "terraria/asset.h"
 #include "terraria/texture2d.h"
@@ -193,6 +194,7 @@ static patch_handle_t f_texture_item_flame = PATCH_NULL;
 
 static patch_handle_t f_item_name_cache = PATCH_NULL;
 static patch_handle_t f_item_tooltip_cache = PATCH_NULL;
+static patch_handle_t f_item_sorting_whitelists = PATCH_NULL; // ItemSorting._layerWhiteLists
 
 static patch_handle_t m_from_language_key = PATCH_NULL; // static ItemTooltip FromLanguageKey(short id, string key)
 
@@ -967,6 +969,60 @@ static void resize_armor_set_bonuses(const int base_count, const int new_size) {
     patchlib_free(bonus_class);
 }
 
+// ============================================================================
+// 背包「整理」(ItemSorting) 兼容
+//
+// ItemSorting.SetupWhiteLists 只用原版物品构建 _layerWhiteLists；
+// ItemSortingLayer.Validate 会按白名单过滤，自定义物品 type 不在任何白名单里
+// 就会被所有分类层丢弃，变成“剩余项”。而 Sort 的放置循环按各分类层的计数
+// (_sort_counts) 递减，剩余项不在计数内 —— 无处安放时 _sort_counts[0] 越界抛
+// 异常，此时背包已被清空、物品还在缓存里，表现为“整理后物品消失”。
+//
+// 在每次 SetupWhiteLists 之后把自定义 type 追加进兜底层白名单即可。
+static void inject_sorting_whitelists() {
+    if (!patchlib_is_valid(f_item_sorting_whitelists))
+        return;
+
+    patch_handle_t dict = PATCH_NULL;
+    patchlib_field_get_value(f_item_sorting_whitelists, PATCH_NULL, &dict);
+    if (!patchlib_is_valid(dict))
+        return;
+
+    // 兜底两层：Not Trash（按稀有度）与 Trash（无条件收尾）
+    static const char *names[] = {"Last - Not Trash", "Last - Trash"};
+    for (size_t n = 0; n < sizeof(names) / sizeof(names[0]); ++n) {
+        patch_handle_t key = patchlib_string_create(names[n]);
+        if (!patchlib_is_valid(key))
+            continue;
+        patch_handle_t list = PATCH_NULL;
+        if (patchlib_dictionary_get_value(dict, &key, &list) &&
+            patchlib_is_valid(list)) {
+            for (size_t i = 0;
+                 i < tefstd_vector_size(&g_terraria_item_registry); ++i) {
+                terraria_item_handle_t **pp =
+                        tefstd_vector_at(&g_terraria_item_registry, i);
+                if (!pp || !*pp || (*pp)->runtime_id < 0)
+                    continue;
+                const int id = (*pp)->runtime_id;
+                patchlib_list_add(list, &id);
+            }
+            patchlib_free(list);
+        }
+        patchlib_free(key);
+    }
+    patchlib_free(dict);
+}
+
+static void setup_white_lists_postfix(patch_handle_t this, void **args,
+                                      void *result,
+                                      const patch_method_signature_t *sig_info) {
+    (void) this;
+    (void) args;
+    (void) result;
+    (void) sig_info;
+    inject_sorting_whitelists();
+}
+
 void terraria_item_manager_init() {
     if (!tefstd_vector_init(&g_terraria_item_registry,
                             sizeof(terraria_item_handle_t *)))
@@ -1029,6 +1085,22 @@ void terraria_item_manager_init() {
             patchlib_type_get_method_by_param_count(lang_cls, "GetItemName", 1);
 
     patchlib_install_prepost_hook(get_item_name, NULL, get_item_name_postfix);
+
+    // 背包整理：自定义物品 type 需注入排序白名单（SetupWhiteLists 仅含原版物品）
+    patch_handle_t item_sorting_cls =
+            patchlib_type_get_type("Terraria.UI", "ItemSorting");
+    if (patchlib_is_valid(item_sorting_cls)) {
+        f_item_sorting_whitelists =
+                patchlib_type_get_field(item_sorting_cls, "_layerWhiteLists");
+        patch_handle_t setup_white_lists = patchlib_type_get_method_by_param_count(
+                item_sorting_cls, "SetupWhiteLists", 0);
+        if (patchlib_is_valid(setup_white_lists)) {
+            patchlib_install_prepost_hook(setup_white_lists, NULL,
+                                          setup_white_lists_postfix);
+            patchlib_free(setup_white_lists);
+        }
+        patchlib_free(item_sorting_cls);
+    }
 
     patch_handle_t item_tooltip_cls = patchlib_type_get_type("Terraria.UI", "ItemTooltip");
     m_from_language_key = patchlib_type_get_method_by_param_count(item_tooltip_cls, "FromLanguageKey", 1);
