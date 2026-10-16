@@ -81,7 +81,7 @@ jobs:
           path: build/ci-windows-x86_64-${{ matrix.build_type }}/
 
   windows-x86:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         build_type: [debug, release]
@@ -90,8 +90,12 @@ jobs:
       - uses: actions/checkout@v4
       
       - name: Install dependencies
-        run: choco install cmake mingw -y
-        
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake make gcc-mingw-w64-i686-posix g++-mingw-w64-i686-posix
+          sudo update-alternatives --set i686-w64-mingw32-gcc /usr/bin/i686-w64-mingw32-gcc-posix
+          sudo update-alternatives --set i686-w64-mingw32-g++ /usr/bin/i686-w64-mingw32-g++-posix
+
       - name: Configure
         run: cmake --preset ci-windows-x86-${{ matrix.build_type }}
         

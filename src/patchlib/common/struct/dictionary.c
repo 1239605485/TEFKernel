@@ -24,6 +24,7 @@
 #include "internal/log.h"
 
 #include "patchlib/method.h"
+#include "patchlib/type.h"
 #include "../../il2cpp_api.h"
 
 static patch_handle_t dictionary_class = NULL;
@@ -184,6 +185,33 @@ bool patchlib_dictionary_set_value(patch_handle_t dictionary, void* key, void* v
     const bool result = patchlib_method_invoke_args(method_set_item, dictionary, NULL, args);
     TEKLOG_DEBUG("Dictionary set_value operation %s", result ? "succeeded" : "failed");
 
+    patchlib_free(method_set_item);
+
+    return result;
+}
+
+bool patchlib_dictionary_set_value_typed(patch_handle_t dictionary,
+                                         patch_handle_t dictionary_type,
+                                         void* key, void* value) {
+    TEKLOG_DEBUG("patchlib_dictionary_set_value_typed called: dictionary=%p, type=%p, key=%p, value=%p",
+                 dictionary, dictionary_type, key, value);
+
+    if (!patchlib_is_valid(dictionary) || !patchlib_is_valid(dictionary_type) ||
+        !key || !value) {
+        TEKLOG_ERROR("Invalid dictionary, type, key or value");
+        return false;
+    }
+
+    patch_handle_t method_set_item =
+            patchlib_type_get_method_by_param_count(dictionary_type, "set_Item", 2);
+    if (!method_set_item) {
+        TEKLOG_ERROR("Failed to find set_Item method on dictionary type");
+        return false;
+    }
+
+    void* args[2] = {key, value};
+    const bool result = patchlib_method_invoke_args(method_set_item, dictionary,
+                                                    NULL, args);
     patchlib_free(method_set_item);
 
     return result;

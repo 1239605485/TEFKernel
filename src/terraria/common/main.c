@@ -86,8 +86,13 @@ static void initialize_almost_everything_postfix(patch_handle_t this, void **arg
         terraria_item_manager_resize();
         terraria_item_manager_init_texture2d();
         TEKLOG_INFO("Arrays resized and textures initialized");
-        
-        // terraria_item_manager_init_localized_text();
+
+        // 填充自定义物品的名称/介绍缓存。此时语言已加载（Program.RunGame
+        // 早于 Main.Initialize），early_init 注册的语言回调也已就绪；
+        // 若文本尚未载入，Language.GetText 会创建占位对象，后续语言加载时
+        // 会原地更新同一个对象，因此这里填充是安全且可自愈的。
+        terraria_item_manager_init_localized_text();
+        TEKLOG_INFO("Custom item localized text initialized");
     }
 
     // 初始化静态数据

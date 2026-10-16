@@ -34,6 +34,7 @@
 #include "patchlib/method.h"
 #include "patchlib/struct/array.h"
 #include "patchlib/struct/dictionary.h"
+#include "patchlib/struct/list.h"
 #include "patchlib/struct/string.h"
 #include "terraria/asset.h"
 #include "terraria/texture2d.h"
@@ -57,7 +58,7 @@ static const char *unknown_item_text(language_culture_t l) {
             "\"item_name_tefkernel_tefkernel\": {"
             "\"unknown\": \"不知道什么语言所以UNKNOWN\""
             "},"
-            "item_tooltip_tefkernel_tefkernel: {"
+            "\"item_tooltip_tefkernel_tefkernel\": {"
             "\"unknown\": \"傻逼泰拉代码\""
             "}"
             "}";
@@ -193,6 +194,7 @@ static patch_handle_t f_texture_item_flame = PATCH_NULL;
 
 static patch_handle_t f_item_name_cache = PATCH_NULL;
 static patch_handle_t f_item_tooltip_cache = PATCH_NULL;
+static patch_handle_t f_item_sorting_whitelists = PATCH_NULL; // ItemSorting._layerWhiteLists
 
 static patch_handle_t m_from_language_key = PATCH_NULL; // static ItemTooltip FromLanguageKey(short id, string key)
 
@@ -300,7 +302,14 @@ static void get_item_name_postfix(patch_handle_t this, void **args,
     patch_handle_t array_item_name_cache = PATCH_NULL;
     patchlib_field_get_value(f_item_name_cache, NULL, &array_item_name_cache);
 
-    patchlib_array_at(array_item_name_cache, current_item_type, result);
+    // 仅当缓存中确实存在条目时才覆盖原版返回值；否则保留原版
+    // GetItemName 返回的 LocalizedText.Empty，避免把结果改写成 null
+    // 造成后续 GetItemNameValue / UI 的 NullReferenceException。
+    patch_handle_t cached_name = PATCH_NULL;
+    if (patchlib_array_at(array_item_name_cache, current_item_type, &cached_name) &&
+        patchlib_is_valid(cached_name) && result) {
+        *(patch_handle_t *) result = cached_name;
+    }
 
     patchlib_free(array_item_name_cache);
 }
@@ -324,24 +333,70 @@ static void content_samples_initialize_postfix(patch_handle_t this, void **args,
     patch_handle_t dict_by_type = PATCH_NULL;
     patch_handle_t dict_net_ids = PATCH_NULL;
     patch_handle_t dict_persist_ids = PATCH_NULL;
+    // 字典的闭合泛型类型句柄（用于 set_Item，避免走 il2cpp_object_get_class）
+    patch_handle_t t_by_type = PATCH_NULL;
+    patch_handle_t t_net_ids = PATCH_NULL;
+    patch_handle_t t_persist_ids = PATCH_NULL;
 
     patch_handle_t f1 = patchlib_type_get_field(cs_type, "ItemsByType");
-    if (patchlib_is_valid(f1))
+    if (patchlib_is_valid(f1)) {
         patchlib_field_get_value(f1, PATCH_NULL, &dict_by_type);
+        t_by_type = patchlib_field_get_type_handle(f1);
+    }
 
     patch_handle_t f2 =
             patchlib_type_get_field(cs_type, "ItemNetIdsByPersistentIds");
-    if (patchlib_is_valid(f2))
+    if (patchlib_is_valid(f2)) {
         patchlib_field_get_value(f2, PATCH_NULL, &dict_net_ids);
+        t_net_ids = patchlib_field_get_type_handle(f2);
+    }
 
     patch_handle_t f3 =
             patchlib_type_get_field(cs_type, "ItemPersistentIdsByNetIds");
-    if (patchlib_is_valid(f3))
+    if (patchlib_is_valid(f3)) {
         patchlib_field_get_value(f3, PATCH_NULL, &dict_persist_ids);
+        t_persist_ids = patchlib_field_get_type_handle(f3);
+    }
 
     /* ---------- 取构造函数 Item(int, ItemVariant) ---------- */
     patch_handle_t m_ctor =
             patchlib_type_get_method_by_param_count(item_type, ".ctor", 2);
+
+    /* ---------- ItemID.Search（ReLogic.Reflection.IdDictionary）-------
+     * 不调用 IdDictionary.Add：移动端用 libffi 调它会在 libil2cpp 崩溃。
+     * 改为直接写它的两个内部字典 _nameToId / _idToName（set_Item 路径已验证可用）。*/
+    patch_handle_t item_id_cls = patchlib_type_get_type("Terraria.ID", "ItemID");
+    patch_handle_t f_search = PATCH_NULL;
+    patch_handle_t search_dict = PATCH_NULL;
+    patch_handle_t f_name_to_id = PATCH_NULL;
+    patch_handle_t f_id_to_name = PATCH_NULL;
+    patch_handle_t dict_name_to_id = PATCH_NULL; // Dictionary<string,int>
+    patch_handle_t dict_id_to_name = PATCH_NULL; // Dictionary<int,string>
+    patch_handle_t t_name_to_id = PATCH_NULL;
+    patch_handle_t t_id_to_name = PATCH_NULL;
+    if (patchlib_is_valid(item_id_cls)) {
+        f_search = patchlib_type_get_field(item_id_cls, "Search");
+        if (patchlib_is_valid(f_search))
+            patchlib_field_get_value(f_search, PATCH_NULL, &search_dict);
+
+        patch_handle_t id_dict_cls =
+                patchlib_type_get_type("ReLogic.Reflection", "IdDictionary");
+        if (patchlib_is_valid(id_dict_cls)) {
+            f_name_to_id = patchlib_type_get_field(id_dict_cls, "_nameToId");
+            f_id_to_name = patchlib_type_get_field(id_dict_cls, "_idToName");
+            if (patchlib_is_valid(f_name_to_id))
+                t_name_to_id = patchlib_field_get_type_handle(f_name_to_id);
+            if (patchlib_is_valid(f_id_to_name))
+                t_id_to_name = patchlib_field_get_type_handle(f_id_to_name);
+            patchlib_free(id_dict_cls);
+        }
+        if (patchlib_is_valid(search_dict)) {
+            if (patchlib_is_valid(f_name_to_id))
+                patchlib_field_get_value(f_name_to_id, search_dict, &dict_name_to_id);
+            if (patchlib_is_valid(f_id_to_name))
+                patchlib_field_get_value(f_id_to_name, search_dict, &dict_id_to_name);
+        }
+    }
 
     /* ---------- 遍历所有自定义物品 ---------- */
     const size_t custom_count = tefstd_vector_size(&g_terraria_item_registry);
@@ -364,7 +419,8 @@ static void content_samples_initialize_postfix(patch_handle_t this, void **args,
         patchlib_constructor_invoke(m_ctor, &item, ctor_args);
 
         /* ----- ItemsByType[item_id] = item ----- */
-        if (!patchlib_dictionary_set_value(dict_by_type, &item_id, &item))
+        if (!patchlib_dictionary_set_value_typed(dict_by_type, t_by_type,
+                                                 &item_id, &item))
             TEKLOG_WARN("ItemsByType set failed: id=%d", item_id);
 
         /* ----- 动态构造持久化 id 字符串 ----- */
@@ -387,12 +443,31 @@ static void content_samples_initialize_postfix(patch_handle_t this, void **args,
 
         if (patchlib_is_valid(str_obj)) {
             /* ----- ItemNetIdsByPersistentIds[persist_id] = item_id ----- */
-            if (!patchlib_dictionary_set_value(dict_net_ids, &str_obj, &item_id))
+            if (!patchlib_dictionary_set_value_typed(dict_net_ids, t_net_ids,
+                                                     &str_obj, &item_id))
                 TEKLOG_WARN("NetIds set failed: id=%d", item_id);
 
             /* ----- ItemPersistentIdsByNetIds[item_id] = persist_id ----- */
-            if (!patchlib_dictionary_set_value(dict_persist_ids, &item_id, &str_obj))
+            if (!patchlib_dictionary_set_value_typed(dict_persist_ids,
+                                                     t_persist_ids, &item_id,
+                                                     &str_obj))
                 TEKLOG_WARN("PersistIds set failed: id=%d", item_id);
+
+            /* ----- ItemID.Search 内部字典：name->id / id->name ----- */
+            if (patchlib_is_valid(dict_name_to_id) &&
+                patchlib_is_valid(t_name_to_id)) {
+                if (!patchlib_dictionary_set_value_typed(dict_name_to_id,
+                                                         t_name_to_id, &str_obj,
+                                                         &item_id))
+                    TEKLOG_WARN("Search nameToId set failed: id=%d", item_id);
+            }
+            if (patchlib_is_valid(dict_id_to_name) &&
+                patchlib_is_valid(t_id_to_name)) {
+                if (!patchlib_dictionary_set_value_typed(dict_id_to_name,
+                                                         t_id_to_name, &item_id,
+                                                         &str_obj))
+                    TEKLOG_WARN("Search idToName set failed: id=%d", item_id);
+            }
         }
 
         /* 释放本轮创建的临时句柄（字典已持有 item/str 的引用） */
@@ -408,9 +483,22 @@ static void content_samples_initialize_postfix(patch_handle_t this, void **args,
     patchlib_free(f1);
     patchlib_free(f2);
     patchlib_free(f3);
+    patchlib_free(t_by_type);
+    patchlib_free(t_net_ids);
+    patchlib_free(t_persist_ids);
     patchlib_free(m_ctor);
     patchlib_free(item_type);
     patchlib_free(cs_type);
+
+    patchlib_free(dict_name_to_id);
+    patchlib_free(dict_id_to_name);
+    patchlib_free(t_name_to_id);
+    patchlib_free(t_id_to_name);
+    patchlib_free(search_dict);
+    patchlib_free(f_name_to_id);
+    patchlib_free(f_id_to_name);
+    patchlib_free(f_search);
+    patchlib_free(item_id_cls);
 
     patchlib_free(dict_by_type);
     patchlib_free(dict_net_ids);
@@ -452,6 +540,9 @@ static void creative_item_sacrifices_catalog_initialize_postfix(
         return;
     }
 
+    // 字典的闭合泛型类型句柄（用于 set_Item，避免 il2cpp_object_get_class）
+    patch_handle_t dict_type = patchlib_field_get_type_handle(field);
+
     /* ---------- 遍历所有自定义物品 ---------- */
     const size_t custom_count = tefstd_vector_size(&g_terraria_item_registry);
     int registered = 0;
@@ -474,7 +565,8 @@ static void creative_item_sacrifices_catalog_initialize_postfix(
             continue;
         }
 
-        if (patchlib_dictionary_set_value(dict, &item_id, &sacrifice_count))
+        if (patchlib_dictionary_set_value_typed(dict, dict_type, &item_id,
+                                                &sacrifice_count))
             registered++;
         else
             TEKLOG_WARN("sacrifice set failed: id=%d", item_id);
@@ -484,6 +576,7 @@ static void creative_item_sacrifices_catalog_initialize_postfix(
 
     /* ---------- 清理 ----------
        注意：dict 是从字段读出的引用，由游戏持有，不要 free */
+    patchlib_free(dict_type);
     patchlib_free(field);
     patchlib_free(cls);
 }
@@ -789,16 +882,28 @@ static void resize_lang_caches(const int base_count, const int new_size) {
     patch_handle_t none = PATCH_NULL;
     if (patchlib_is_valid(f_none))
         patchlib_field_get_value(f_none, NULL, &none);
+    // 新槽位必须填充 ItemTooltip.None，否则 Lang.GetTooltip() 会返回 null，
+    // 经 Item.RebuildTooltip() 写入 ToolTip 后在渲染提示时 NRE。
     resize_array("Terraria", "Lang", "_itemTooltipCache", tooltip_class,
-                 new_size, NULL);
+                 new_size, patchlib_is_valid(none) ? &none : NULL);
 
     if (patchlib_is_valid(none))
         patchlib_free(none);
     if (patchlib_is_valid(f_none))
         patchlib_free(f_none);
 
-    // _itemNameCache: LocalizedText[]（GetItemName 对 null 槽位有判断，无需填充）
-    resize_array("Terraria", "Lang", "_itemNameCache", name_class, new_size, NULL);
+    // _itemNameCache: LocalizedText[]，新槽位填 LocalizedText.Empty
+    // （GetItemName 的钩子会读取该数组，null 会被写回到返回值）。
+    patch_handle_t f_empty = patchlib_type_get_field(name_class, "Empty");
+    patch_handle_t empty = PATCH_NULL;
+    if (patchlib_is_valid(f_empty))
+        patchlib_field_get_value(f_empty, NULL, &empty);
+    resize_array("Terraria", "Lang", "_itemNameCache", name_class, new_size,
+                 patchlib_is_valid(empty) ? &empty : NULL);
+    if (patchlib_is_valid(empty))
+        patchlib_free(empty);
+    if (patchlib_is_valid(f_empty))
+        patchlib_free(f_empty);
 
     // _layerIndexForItemType: int[]（GetSortingLayerIndex 无边界检查，
     // 物品进背包触发排序时按 type 索引，越界导致物品"消失"）
@@ -864,6 +969,120 @@ static void resize_armor_set_bonuses(const int base_count, const int new_size) {
     patchlib_free(bonus_class);
 }
 
+// ============================================================================
+// 背包「整理」(ItemSorting) 兼容
+//
+// ItemSorting.SetupWhiteLists 只用原版物品构建 _layerWhiteLists；
+// ItemSortingLayer.Validate 会按白名单过滤，自定义物品 type 不在任何白名单里
+// 就会被所有分类层丢弃，变成“剩余项”。而 Sort 的放置循环按各分类层的计数
+// (_sort_counts) 递减，剩余项不在计数内 —— 无处安放时 _sort_counts[0] 越界抛
+// 异常，此时背包已被清空、物品还在缓存里，表现为“整理后物品消失”。
+//
+// 在每次 SetupWhiteLists 之后把自定义 type 追加进兜底层白名单即可。
+static void inject_sorting_whitelists() {
+    if (!patchlib_is_valid(f_item_sorting_whitelists))
+        return;
+
+    patch_handle_t dict = PATCH_NULL;
+    patchlib_field_get_value(f_item_sorting_whitelists, PATCH_NULL, &dict);
+    if (!patchlib_is_valid(dict))
+        return;
+
+    // 兜底两层：Not Trash（按稀有度）与 Trash（无条件收尾）
+    static const char *names[] = {"Last - Not Trash", "Last - Trash"};
+
+#if defined(__ANDROID__)
+    // Android：用内核封装的字典/列表 API（内部走 il2cpp_object_get_class，手机端可用）
+    for (size_t n = 0; n < sizeof(names) / sizeof(names[0]); ++n) {
+        patch_handle_t key = patchlib_string_create(names[n]);
+        if (!patchlib_is_valid(key))
+            continue;
+        patch_handle_t list = PATCH_NULL;
+        if (patchlib_dictionary_get_value(dict, &key, &list) &&
+            patchlib_is_valid(list)) {
+            for (size_t i = 0;
+                 i < tefstd_vector_size(&g_terraria_item_registry); ++i) {
+                terraria_item_handle_t **pp =
+                        tefstd_vector_at(&g_terraria_item_registry, i);
+                if (!pp || !*pp || (*pp)->runtime_id < 0)
+                    continue;
+                const int id = (*pp)->runtime_id;
+                patchlib_list_add(list, &id);
+            }
+            patchlib_free(list);
+        }
+        patchlib_free(key);
+    }
+#else
+    // 桌面端：il2cpp_object_get_class 对泛型实例会返回坏句柄 → 崩。
+    // 改用字段类型句柄取 get_Item，再用其返回类型句柄取 Add，自行 invoke。
+    patch_handle_t dict_type =
+            patchlib_field_get_type_handle(f_item_sorting_whitelists);
+    if (!patchlib_is_valid(dict_type)) {
+        patchlib_free(dict);
+        return;
+    }
+    patch_handle_t m_get =
+            patchlib_type_get_method_by_param_count(dict_type, "get_Item", 1);
+    if (!patchlib_is_valid(m_get)) {
+        patchlib_free(dict_type);
+        patchlib_free(dict);
+        return;
+    }
+
+    patch_method_signature_t sig;
+    const bool sig_ok = patchlib_method_get_signature(m_get, &sig);
+    patch_handle_t m_add = PATCH_NULL;
+    if (sig_ok && patchlib_is_valid(sig.return_type_handle))
+        m_add = patchlib_type_get_method_by_param_count(sig.return_type_handle,
+                                                        "Add", 1);
+
+    for (size_t n = 0; n < sizeof(names) / sizeof(names[0]); ++n) {
+        patch_handle_t key = patchlib_string_create(names[n]);
+        if (!patchlib_is_valid(key))
+            continue;
+        patch_handle_t list = PATCH_NULL;
+        void *gargs[1] = {&key};
+        const bool got = patchlib_method_invoke_args(m_get, dict, &list, gargs);
+        if (got && patchlib_is_valid(list)) {
+            if (patchlib_is_valid(m_add)) {
+                for (size_t i = 0;
+                     i < tefstd_vector_size(&g_terraria_item_registry); ++i) {
+                    terraria_item_handle_t **pp =
+                            tefstd_vector_at(&g_terraria_item_registry, i);
+                    if (!pp || !*pp || (*pp)->runtime_id < 0)
+                        continue;
+                    const int id = (*pp)->runtime_id;
+                    void *aargs[1] = {&id};
+                    patchlib_method_invoke_args(m_add, list, PATCH_NULL, aargs);
+                }
+            }
+            patchlib_free(list);
+        }
+        patchlib_free(key);
+    }
+
+    if (patchlib_is_valid(m_add))
+        patchlib_free(m_add);
+    if (sig_ok)
+        patchlib_method_signature_free(&sig);
+    patchlib_free(m_get);
+    patchlib_free(dict_type);
+#endif
+
+    patchlib_free(dict);
+}
+
+static void setup_white_lists_postfix(patch_handle_t this, void **args,
+                                      void *result,
+                                      const patch_method_signature_t *sig_info) {
+    (void) this;
+    (void) args;
+    (void) result;
+    (void) sig_info;
+    inject_sorting_whitelists();
+}
+
 void terraria_item_manager_init() {
     if (!tefstd_vector_init(&g_terraria_item_registry,
                             sizeof(terraria_item_handle_t *)))
@@ -927,8 +1146,34 @@ void terraria_item_manager_init() {
 
     patchlib_install_prepost_hook(get_item_name, NULL, get_item_name_postfix);
 
+    // 背包整理：自定义物品 type 需注入排序白名单（SetupWhiteLists 仅含原版物品）
+    patch_handle_t item_sorting_cls =
+            patchlib_type_get_type("Terraria.UI", "ItemSorting");
+    if (patchlib_is_valid(item_sorting_cls)) {
+        f_item_sorting_whitelists =
+                patchlib_type_get_field(item_sorting_cls, "_layerWhiteLists");
+        patch_handle_t setup_white_lists = patchlib_type_get_method_by_param_count(
+                item_sorting_cls, "SetupWhiteLists", 0);
+        if (patchlib_is_valid(setup_white_lists)) {
+            patchlib_install_prepost_hook(setup_white_lists, NULL,
+                                          setup_white_lists_postfix);
+            patchlib_free(setup_white_lists);
+        }
+        patchlib_free(item_sorting_cls);
+    }
+
     patch_handle_t item_tooltip_cls = patchlib_type_get_type("Terraria.UI", "ItemTooltip");
-    m_from_language_key = patchlib_type_get_method_by_param_count(item_tooltip_cls, "FromLanguageKey", 2);
+    // 两端签名不同：
+    //   桌面  FromLanguageKey(string key)              → 1 参
+    //   手机  FromLanguageKey(short id, string key)    → 2 参（见 dump/ItemTooltip/FromLanguageKey.txt）
+    m_from_language_key = patchlib_type_get_method_by_param_count(
+            item_tooltip_cls, "FromLanguageKey",
+#if __ANDROID__
+            2
+#else
+            1
+#endif
+    );
 
     // ---- 自定义物品常用字段/方法（存档等功能模块通过 get_item_ops 取用）----
     f_item_prefix = patchlib_type_get_field(item_class, "prefix");
@@ -1007,17 +1252,40 @@ bool terraria_item_manager_register_item(terraria_item_handle_t *item_handle) {
         }
     }
 
+    if (g_ids_assigned) {
+        // ID 已在 Main.Initialize 分配完成。此时新增物品不会获得有效
+        // runtime_id，且按 type 索引的静态数组也不会再扩容，直接使用会越界。
+        // 这里只告警；Mod 应在游戏初始化前完成注册。
+        TEKLOG_WARN("item registered after IDs assigned: %s.%s.%s "
+                    "(runtime_id will stay -1 until re-init)",
+                    item_handle->parent_modloader_id ? item_handle->parent_modloader_id : "?",
+                    item_handle->parent_id ? item_handle->parent_id : "?",
+                    item_handle->internal_name ? item_handle->internal_name : "?");
+    }
+
     /* 加入 registry */
     return tefstd_vector_push_back(&g_terraria_item_registry, &item_handle);
 }
 
 bool terraria_item_manager_unregister_item_by_id(const int runtime_id) {
-    if (runtime_id == 0)
+    if (runtime_id < 0)
         return false;
 
     const size_t count = tefstd_vector_size(&g_terraria_item_registry);
     for (size_t i = 0; i < count; i++) {
-        return tefstd_vector_erase(&g_terraria_item_registry, runtime_id, NULL);
+        terraria_item_handle_t **pp =
+                tefstd_vector_at(&g_terraria_item_registry, i);
+        if (!pp || !*pp)
+            continue;
+        if ((*pp)->runtime_id == runtime_id) {
+            const bool removed =
+                    tefstd_vector_erase(&g_terraria_item_registry, i, NULL);
+            // registry 按下标紧凑映射 runtime_id，删除后必须重新分配，
+            // 否则 get_item / set_defaults_postfix / 存档的索引都会错位。
+            if (removed)
+                terraria_item_manager_assign_ids(terraria_item_id_get_count());
+            return removed;
+        }
     }
     return false;
 }
@@ -1342,6 +1610,76 @@ static void force_resize_critical_item_sets(const int new_size) {
         force_resize_itemid_set(names[i], new_size);
 }
 
+// Terraria.GameContent.QuickStacking.MatchingItemTypeDestinationList
+// .firstEntryForType 是 int[ItemID.Count]，在 Tail/Add/Lookup 中直接按物品
+// type 索引且无边界检查。快速堆叠到箱子/银行时会用它给自定义物品分类，
+// 不扩容就会 IndexOutOfRangeException。该实例是 QuickStacking 的静态字段
+// matchingItemTypeScratch。新槽位填 0（表示无条目）即可。
+static void resize_quickstacking(const int new_size) {
+    if (new_size <= 0)
+        return;
+
+    patch_handle_t qs_class =
+            patchlib_type_get_type("Terraria.GameContent", "QuickStacking");
+    if (!patchlib_is_valid(qs_class))
+        return;
+
+    patch_handle_t nested_class =
+            patchlib_type_get_inner_type(qs_class, "MatchingItemTypeDestinationList");
+    patch_handle_t f_scratch =
+            patchlib_type_get_field(qs_class, "matchingItemTypeScratch");
+    if (!patchlib_is_valid(nested_class) || !patchlib_is_valid(f_scratch)) {
+        if (patchlib_is_valid(nested_class))
+            patchlib_free(nested_class);
+        if (patchlib_is_valid(f_scratch))
+            patchlib_free(f_scratch);
+        patchlib_free(qs_class);
+        return;
+    }
+
+    patch_handle_t scratch = PATCH_NULL;
+    patchlib_field_get_value(f_scratch, NULL, &scratch);
+    if (!patchlib_is_valid(scratch)) {
+        patchlib_free(f_scratch);
+        patchlib_free(nested_class);
+        patchlib_free(qs_class);
+        return;
+    }
+
+    patch_handle_t f_first =
+            patchlib_type_get_field(nested_class, "firstEntryForType");
+    if (patchlib_is_valid(f_first)) {
+        patch_handle_t array = PATCH_NULL;
+        patchlib_field_get_value(f_first, scratch, &array);
+        if (patchlib_is_valid(array)) {
+            const size_t len = patchlib_array_length(array);
+            if (len > 0 && len < (size_t) new_size) {
+                patch_handle_t int_type = patchlib_get_basic_type(PATCH_INT32);
+                patch_handle_t narray =
+                        patchlib_array_create(new_size, int_type);
+                patchlib_free(int_type);
+                if (patchlib_is_valid(narray)) {
+                    // 新数组默认全 0；复制旧数据
+                    patchlib_array_copy(narray, array, len);
+                    patchlib_field_set_value(f_first, scratch, &narray);
+                    TEKLOG_INFO("resize_quickstacking: ✅ firstEntryForType (%zu -> %d)",
+                                len, new_size);
+                    patchlib_free(narray);
+                } else {
+                    TEKLOG_ERROR("resize_quickstacking: failed to create new array");
+                }
+            }
+            patchlib_free(array);
+        }
+        patchlib_free(f_first);
+    }
+
+    patchlib_free(scratch);
+    patchlib_free(f_scratch);
+    patchlib_free(nested_class);
+    patchlib_free(qs_class);
+}
+
 void terraria_item_manager_resize() {
     const int new_size = terraria_item_manager_get_count();
 
@@ -1370,6 +1708,8 @@ void terraria_item_manager_resize() {
     resize_armor_set_bonuses(terraria_item_id_get_count(), new_size);
     // 兜底：强制扩容运行时物品更新/拾取/绘制会用到的 ItemID.Sets 集合
     force_resize_critical_item_sets(new_size);
+    // 快速堆叠按 type 索引的 firstEntryForType（无边界检查）
+    resize_quickstacking(new_size);
 
     patchlib_free(bool_type);
     patchlib_free(int_type);
@@ -1484,29 +1824,36 @@ void terraria_item_manager_init_localized_text() {
         patchlib_free(item_name_key);
         free(item_name_key_buffer);
 
-        if (current->has_tooltip) {
-            char *item_tooltip_key_buffer = generate_key(15, "item_tooltip", current);
-            patch_handle_t item_tooltip_key =
-                    terraria_language_manager_get_localized_text(item_tooltip_key_buffer);
+        if (current->has_tooltip && patchlib_is_valid(m_from_language_key)) {
+            // 注意：generate_key 需要包含结尾 '\0'。格式 "%s_%s_%s.%s"
+            // 的分隔符共 3 个，"item_tooltip" 长度为 12，故基数应为 12+3+1=16。
+            char *item_tooltip_key_buffer = generate_key(16, "item_tooltip", current);
+
+            // ItemTooltip.FromLanguageKey：桌面为 (string key)；手机为 (short id, string key)。
+            patch_handle_t item_tooltip_key_str =
+                    patchlib_string_create(item_tooltip_key_buffer);
+            patch_handle_t item_tooltip = PATCH_NULL;
 
 #if __ANDROID__
-            patch_handle_t item_tooltip = ((void*(*)(short, void *)) patchlib_method_get_pointer(m_from_language_key))(
-                (short) target_index, item_tooltip_key);
+            int16_t tooltip_id = (int16_t) target_index;
+            void *args[2] = {&tooltip_id, &item_tooltip_key_str};
 #else
-            void *args[2] = {&target_index, &item_tooltip_key};
-            patch_handle_t item_tooltip = PATCH_NULL;
-            patchlib_method_invoke_args(m_from_language_key, NULL, args, &item_tooltip);
-# endif
+            void *args[1] = {&item_tooltip_key_str};
+#endif
+            patchlib_method_invoke_args(m_from_language_key, NULL, &item_tooltip, args);
 
-            patchlib_array_set(array_item_tooltip_cache, target_index, &item_tooltip);
+            if (patchlib_is_valid(item_tooltip))
+                patchlib_array_set(array_item_tooltip_cache, target_index, &item_tooltip);
 
             patchlib_free(item_tooltip);
-            patchlib_free(item_tooltip_key);
+            patchlib_free(item_tooltip_key_str);
             free(item_tooltip_key_buffer);
         }
     }
 
     patchlib_free(array_item_tooltip_cache);
     patchlib_free(array_item_name_cache);
-    patchlib_free(f_item_name_cache);
+    // 注意：不要释放 f_item_name_cache / f_item_tooltip_cache，
+    // 它们是 item_manager 持有的全局字段句柄，get_item_name_postfix
+    // 等钩子仍会继续使用。
 }

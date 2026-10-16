@@ -53,6 +53,10 @@ bool patchlib_type_is_same(patch_handle_t t1, patch_handle_t t2) {
 }
 
 void patchlib_free(patch_handle_t type) {
+    // loader 的 il2cpp_free 对 GCHandle.Zero 会抛 "GCHandle value cannot be zero"，
+    // 从而中断当前钩子。这里先判空，保证 patchlib_free(NULL) 安全。
+    if (type == PATCH_NULL)
+        return;
     il2cpp_free(type);
 }
 
