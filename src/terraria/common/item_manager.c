@@ -988,6 +988,31 @@ static void inject_sorting_whitelists() {
     if (!patchlib_is_valid(dict))
         return;
 
+    // 用字段的类型句柄取 get_Item（与 set_value_typed 一致）；
+    // 不要用 il2cpp_object_get_class，桌面端对泛型实例会崩。
+    patch_handle_t dict_type =
+            patchlib_field_get_type_handle(f_item_sorting_whitelists);
+    if (!patchlib_is_valid(dict_type)) {
+        patchlib_free(dict);
+        return;
+    }
+    patch_handle_t m_get =
+            patchlib_type_get_method_by_param_count(dict_type, "get_Item", 1);
+    if (!patchlib_is_valid(m_get)) {
+        patchlib_free(dict_type);
+        patchlib_free(dict);
+        return;
+    }
+
+    // 通过 get_Item 的返回类型句柄拿到 List<int>，再取 Add。
+    // 不能用 patchlib_list_add：它内部用 il2cpp_object_get_class，桌面端会崩。
+    patch_method_signature_t sig;
+    bool sig_ok = patchlib_method_get_signature(m_get, &sig);
+    patch_handle_t m_add = PATCH_NULL;
+    if (sig_ok && patchlib_is_valid(sig.return_type_handle))
+        m_add = patchlib_type_get_method_by_param_count(sig.return_type_handle,
+                                                        "Add", 1);
+
     // 兜底两层：Not Trash（按稀有度）与 Trash（无条件收尾）
     static const char *names[] = {"Last - Not Trash", "Last - Trash"};
     for (size_t n = 0; n < sizeof(names) / sizeof(names[0]); ++n) {
@@ -995,21 +1020,32 @@ static void inject_sorting_whitelists() {
         if (!patchlib_is_valid(key))
             continue;
         patch_handle_t list = PATCH_NULL;
-        if (patchlib_dictionary_get_value(dict, &key, &list) &&
-            patchlib_is_valid(list)) {
-            for (size_t i = 0;
-                 i < tefstd_vector_size(&g_terraria_item_registry); ++i) {
-                terraria_item_handle_t **pp =
-                        tefstd_vector_at(&g_terraria_item_registry, i);
-                if (!pp || !*pp || (*pp)->runtime_id < 0)
-                    continue;
-                const int id = (*pp)->runtime_id;
-                patchlib_list_add(list, &id);
+        void *gargs[1] = {&key};
+        const bool got = patchlib_method_invoke_args(m_get, dict, &list, gargs);
+        if (got && patchlib_is_valid(list)) {
+            if (patchlib_is_valid(m_add)) {
+                for (size_t i = 0;
+                     i < tefstd_vector_size(&g_terraria_item_registry); ++i) {
+                    terraria_item_handle_t **pp =
+                            tefstd_vector_at(&g_terraria_item_registry, i);
+                    if (!pp || !*pp || (*pp)->runtime_id < 0)
+                        continue;
+                    const int id = (*pp)->runtime_id;
+                    void *aargs[1] = {&id};
+                    patchlib_method_invoke_args(m_add, list, PATCH_NULL, aargs);
+                }
             }
             patchlib_free(list);
         }
         patchlib_free(key);
     }
+
+    if (patchlib_is_valid(m_add))
+        patchlib_free(m_add);
+    if (sig_ok)
+        patchlib_method_signature_free(&sig);
+    patchlib_free(m_get);
+    patchlib_free(dict_type);
     patchlib_free(dict);
 }
 
