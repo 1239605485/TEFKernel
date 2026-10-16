@@ -988,8 +988,34 @@ static void inject_sorting_whitelists() {
     if (!patchlib_is_valid(dict))
         return;
 
-    // 用字段的类型句柄取 get_Item（与 set_value_typed 一致）；
-    // 不要用 il2cpp_object_get_class，桌面端对泛型实例会崩。
+    // 兜底两层：Not Trash（按稀有度）与 Trash（无条件收尾）
+    static const char *names[] = {"Last - Not Trash", "Last - Trash"};
+
+#if defined(__ANDROID__)
+    // Android：用内核封装的字典/列表 API（内部走 il2cpp_object_get_class，手机端可用）
+    for (size_t n = 0; n < sizeof(names) / sizeof(names[0]); ++n) {
+        patch_handle_t key = patchlib_string_create(names[n]);
+        if (!patchlib_is_valid(key))
+            continue;
+        patch_handle_t list = PATCH_NULL;
+        if (patchlib_dictionary_get_value(dict, &key, &list) &&
+            patchlib_is_valid(list)) {
+            for (size_t i = 0;
+                 i < tefstd_vector_size(&g_terraria_item_registry); ++i) {
+                terraria_item_handle_t **pp =
+                        tefstd_vector_at(&g_terraria_item_registry, i);
+                if (!pp || !*pp || (*pp)->runtime_id < 0)
+                    continue;
+                const int id = (*pp)->runtime_id;
+                patchlib_list_add(list, &id);
+            }
+            patchlib_free(list);
+        }
+        patchlib_free(key);
+    }
+#else
+    // 桌面端：il2cpp_object_get_class 对泛型实例会返回坏句柄 → 崩。
+    // 改用字段类型句柄取 get_Item，再用其返回类型句柄取 Add，自行 invoke。
     patch_handle_t dict_type =
             patchlib_field_get_type_handle(f_item_sorting_whitelists);
     if (!patchlib_is_valid(dict_type)) {
@@ -1004,17 +1030,13 @@ static void inject_sorting_whitelists() {
         return;
     }
 
-    // 通过 get_Item 的返回类型句柄拿到 List<int>，再取 Add。
-    // 不能用 patchlib_list_add：它内部用 il2cpp_object_get_class，桌面端会崩。
     patch_method_signature_t sig;
-    bool sig_ok = patchlib_method_get_signature(m_get, &sig);
+    const bool sig_ok = patchlib_method_get_signature(m_get, &sig);
     patch_handle_t m_add = PATCH_NULL;
     if (sig_ok && patchlib_is_valid(sig.return_type_handle))
         m_add = patchlib_type_get_method_by_param_count(sig.return_type_handle,
                                                         "Add", 1);
 
-    // 兜底两层：Not Trash（按稀有度）与 Trash（无条件收尾）
-    static const char *names[] = {"Last - Not Trash", "Last - Trash"};
     for (size_t n = 0; n < sizeof(names) / sizeof(names[0]); ++n) {
         patch_handle_t key = patchlib_string_create(names[n]);
         if (!patchlib_is_valid(key))
@@ -1046,6 +1068,8 @@ static void inject_sorting_whitelists() {
         patchlib_method_signature_free(&sig);
     patchlib_free(m_get);
     patchlib_free(dict_type);
+#endif
+
     patchlib_free(dict);
 }
 
