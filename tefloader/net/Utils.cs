@@ -259,6 +259,18 @@ public static class Utils
                 return ReadEnumValue(source, targetType);
             }
 
+            // Nullable<T>（如 SpriteBatch.Begin 的 Matrix?）：bool hasValue + 对齐后的 T
+            var underlying = Nullable.GetUnderlyingType(targetType);
+            if (underlying != null)
+            {
+                if (Marshal.ReadByte(source) == 0) return null;
+                int off;
+                if (!underlying.IsValueType) off = IntPtr.Size;
+                else if (underlying == typeof(double) || underlying == typeof(long) || underlying == typeof(ulong)) off = 8;
+                else off = 4;
+                return GetNativeValue(IntPtr.Add(source, off), underlying);
+            }
+
             // 基本类型读取（对应 patch_type_t）
             if (targetType == typeof(void)) return null;
             if (targetType == typeof(sbyte)) return (sbyte)Marshal.ReadByte(source);
@@ -373,8 +385,10 @@ public static class Utils
         // 对应 PATCH_CHAR
         if (type == typeof(char)) return true;
 
-        // 所有其他类型（包括 string、数组、类、结构体等）都视为 PATCH_OBJECT
-        return false;
+        // 其它值类型（结构体，如 Vector2/Color）按内联值处理（内核 C 端对应 PATCH_STRUCT），
+        // 不能当作 PATCH_OBJECT 存 GCHandle —— 否则按结构体字节读会错乱/崩溃。
+        // 只有引用类型（string/数组/类等）才走 PATCH_OBJECT。
+        return type.IsValueType;
     }
 
     /// <summary>

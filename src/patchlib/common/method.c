@@ -166,11 +166,9 @@ static patch_type_t il2cpp_type_to_patch_type(patch_handle_t type) {
                 }
             }
 
-            patchlib_free(parent);
-            patchlib_free(kclass);
-
             // 结构体 - 需要展开或按指针处理
             // 对于复杂结构体，返回 PATCH_STRUCT 让调用者通过指针访问
+            // 注意：parent / kclass 已在上面释放过，这里不能再 free（否则 GCHandle double free → 崩溃）
             result = PATCH_STRUCT;
             break;
         }
