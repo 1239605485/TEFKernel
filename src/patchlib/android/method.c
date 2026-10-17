@@ -285,6 +285,11 @@ bool patchlib_method_invoke_args(patch_handle_t method, patch_handle_t instance,
     /* ---------- 返回类型 ---------- */
     ffi_type* return_ffi_type =
         patch_type_to_ffi_type(signature.return_type, signature.return_type_handle);
+    if (signature.return_type == PATCH_STRUCT) {
+        TEKLOG_DEBUG("invoke STRUCT return: method=%p handle=%p ffi=%p size=%zu",
+                    method, signature.return_type_handle, return_ffi_type,
+                    return_ffi_type ? return_ffi_type->size : (size_t)0);
+    }
     if (!return_ffi_type) {
         TEKLOG_ERROR("Invalid return type");
         free(arg_values);
