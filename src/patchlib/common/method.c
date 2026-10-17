@@ -202,7 +202,13 @@ bool patchlib_method_get_signature(patch_handle_t method, patch_method_signature
 
     signature->method = method;
     signature->token = patchlib_method_get_token(signature->method);
-    signature->return_type_handle = il2cpp_method_get_return_type(method);
+    /* 注意：这里必须是 **Class\***（和下面的参数一致）。
+     * il2cpp_method_get_return_type 给的是 Type*，而 patch_type_to_ffi_type() 的
+     * PATCH_STRUCT 分支会拿它去 il2cpp_class_get_fields()（要 Class*），
+     * 喂 Type* 会取不到字段 → ffi_type 变成空结构体 → libffi 调用时
+     * **不写返回缓冲** → 结构体返回值（如 Vector2）恒为调用者初始化值 (0,0)。 */
+    signature->return_type_handle =
+        il2cpp_class_from_type(il2cpp_method_get_return_type(method));
     signature->return_type = patchlib_method_get_return_type(method);
     signature->is_instance = patchlib_method_is_instance(method);
     tefstd_vector_init(&signature->arg_types, sizeof(patch_type_t));

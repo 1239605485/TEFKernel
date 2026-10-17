@@ -115,20 +115,34 @@ ffi_type* patch_type_to_ffi_type(const patch_type_t type, patch_handle_t struct_
             patchlib_type_get_fields(struct_type, false, &fields);
 
             const size_t field_count = tefstd_vector_size(&fields);
+            /* 诊断：结构体 ffi 展开时到底有没有拿到字段 / 其中多少是实例字段 */
+            size_t inst_count = 0;
+            for (size_t i = 0; i < field_count; i++) {
+                patch_handle_t fh = *(patch_handle_t*)tefstd_vector_at(&fields, i);
+                if (fh && !patchlib_field_is_static(fh)) inst_count++;
+            }
+            TEKLOG_DEBUG("STRUCT ffi: handle=%p fields=%zu instance=%zu",
+                        struct_type, field_count, inst_count);
 
-            ffi_type **elements = malloc((field_count + 1) * sizeof(ffi_type *));
+            ffi_type **elements = malloc((inst_count + 1) * sizeof(ffi_type *));
 
-            for (int i = 0; i < field_count; i++) {
-                // 你需要通过 struct_type 和索引获取每个字段的类型句柄
-                // 假设 patchlib_struct_get_field_type 返回一个表示字段类型的 patch_handle_t
-                patch_handle_t field_type_handle = *(patch_handle_t*)tefstd_vector_at(&fields, i);
-                elements[i] = patch_type_to_ffi_type(
-                    patchlib_field_get_type(field_type_handle), // 获取 PATCH_* 类型
-                    il2cpp_class_from_type(il2cpp_field_get_type(field_type_handle)) // 如果是嵌套结构体，传入其句柄
+            /* ★ 只取**实例字段**：il2cpp_class_get_fields 会把 static 字段一起返回，
+             *   例如 Vector2 有 X/Y + Zero/One/UnitX/UnitY(static) 共 6 个，
+             *   全塞进 ffi_type 就会把 8 字节的向量当成 24 字节的结构体，
+             *   libffi 于是按 sret 指针读返回值 —— 而真实方法是从 s0/s1 返回的，
+             *   结果拿到全 0（这就是 Vector2 返回值恒 (0,0) 的根因）。 */
+            size_t ei = 0;
+            for (size_t i = 0; i < field_count; i++) {
+                patch_handle_t fh = *(patch_handle_t*)tefstd_vector_at(&fields, i);
+                if (!fh || patchlib_field_is_static(fh)) continue;
+                patch_handle_t ft = il2cpp_field_get_type(fh);
+                elements[ei++] = patch_type_to_ffi_type(
+                    patchlib_field_get_type(fh),
+                    il2cpp_class_from_type(ft)
                 );
             }
             tefstd_vector_destroy(&fields);
-            elements[field_count] = NULL;
+            elements[ei] = NULL;
 
             ffi_type *struct_ffi = malloc(sizeof(ffi_type));
             if (!struct_ffi) {
