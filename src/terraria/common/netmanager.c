@@ -1079,7 +1079,8 @@ static bool send_data_hook(patch_handle_t instance, void **args,
         if (terraria_netmanager_client_errors[remote_client] == ERROR_MOD_REQUIRED ||
             terraria_netmanager_client_errors[remote_client] == ERROR_VERSION) {
 
-            patchlib_free(error_text);
+            /* ⚠ 不要 free 回调参数句柄：加载器在 CleanupContext 里会统一释放，
+             * 再 free 一次就是 double free（桌面 GCHandle → mono_gchandle 崩溃）。 */
 
             char error_msg[512];
             const char *error_type = terraria_netmanager_client_errors[remote_client] == ERROR_VERSION
@@ -1107,7 +1108,7 @@ static bool send_hook(patch_handle_t instance, void **args,
     patchlib_array_at(array, 2, &pack_id);
 
     if (pack_id == 1) {
-        patchlib_free(array);
+        /* 同上：args[0] 是回调参数句柄，不在这里释放。 */
         patch_handle_t pack = terraria_netmanager_create_tefkernel_pack();
         *(patch_handle_t *) args[0] = pack;
 #if defined(__ANDROID__)
