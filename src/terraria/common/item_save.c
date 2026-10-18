@@ -33,6 +33,7 @@
  *******************************************************************************/
 
 #include "internal/terraria/item_save.h"
+#include "internal/flags.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -635,6 +636,10 @@ static void chest_load_postfix(patch_handle_t this, void **args, void *result,
 // ------------------------------------------------------------------
 
 void terraria_item_save_init() {
+  if (tef_flag("no_item_save")) {
+    TEKLOG_WARN("tef_flag: no_item_save - item save hooks disabled");
+    return;
+  }
   terraria_item_manager_get_item_ops(&g_ops);
 
   patch_handle_t player_class = patchlib_type_get_type("Terraria", "Player");

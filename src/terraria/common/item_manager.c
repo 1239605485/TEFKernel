@@ -21,6 +21,7 @@
  *******************************************************************************/
 
 #include "internal/terraria/item_manager.h"
+#include "internal/flags.h"
 #include "terraria/language_manager.h"
 #include "terraria/recipe_manager.h"
 
@@ -38,6 +39,7 @@
 #include "patchlib/struct/string.h"
 #include "terraria/asset.h"
 #include "terraria/texture2d.h"
+
 
 tefstd_vector_t g_terraria_item_registry; // 存储 terraria_item_handle_t*
 static bool g_ids_assigned = false;
@@ -184,6 +186,8 @@ static terraria_item_handle_t unknown_item = {
     }
 };
 
+
+
 static patch_handle_t f_type = PATCH_NULL;
 static patch_handle_t f_stack = PATCH_NULL;
 static patch_handle_t m_reset_stats = PATCH_NULL;
@@ -240,6 +244,13 @@ static int resolve_prefix_sets(void) {
     return g_prefix_sets_state;
   g_prefix_sets_state = 0;
 
+  /* ⚠ 句柄生命周期（桌面 Mono 上踩过崩溃）：
+   * 内核约定是"field 句柄必须在 class 句柄之前释放"，因为桌面端
+   * field 句柄是依附 class 弱句柄的。这里这些 field 句柄要**长期缓存**，
+   * 所以它们所属的 class 句柄绝对不能提前 free ——
+   * 否则之后 field_get_value() 会让 loader 的托管包装去校验已失效的
+   * GCHandle，直接 SIGSEGV 在 mono_gchandle_is_in_domain。
+   * 这些句柄只在启动时取一次，常驻即可（泄漏量可忽略）。 */
   patch_handle_t pl =
       patchlib_type_get_type("Terraria.GameContent.Prefixes", "PrefixLegacy");
   if (!patchlib_is_valid(pl)) {
@@ -247,7 +258,6 @@ static int resolve_prefix_sets(void) {
     return 0;
   }
   patch_handle_t sets = patchlib_type_get_inner_type(pl, "ItemSets");
-  patchlib_free(pl);
   if (!patchlib_is_valid(sets)) {
     TEKLOG_WARN("prefix: PrefixLegacy+ItemSets not found");
     return 0;
@@ -261,17 +271,13 @@ static int resolve_prefix_sets(void) {
   f_pref_boomerang = patchlib_type_get_field(sets, "BoomerangsChakrams");
   f_pref_legendary2 =
       patchlib_type_get_field(sets, "ItemsThatCanHaveLegendary2");
-  patchlib_free(sets);
 
   patch_handle_t itemid = patchlib_type_get_type("Terraria.ID", "ItemID");
+  patch_handle_t idsets = PATCH_NULL;
   if (patchlib_is_valid(itemid)) {
-    patch_handle_t idsets = patchlib_type_get_inner_type(itemid, "Sets");
-    patchlib_free(itemid);
-    if (patchlib_is_valid(idsets)) {
-      f_can_get_prefixes =
-          patchlib_type_get_field(idsets, "CanGetPrefixes");
-      patchlib_free(idsets);
-    }
+    idsets = patchlib_type_get_inner_type(itemid, "Sets");
+    if (patchlib_is_valid(idsets))
+      f_can_get_prefixes = patchlib_type_get_field(idsets, "CanGetPrefixes");
   }
 
   if (!patchlib_is_valid(f_pref_swords) ||
@@ -292,11 +298,17 @@ static void prefix_set_entry(patch_handle_t field, const int type,
                              const char *name) {
   if (!patchlib_is_valid(field) || type < 0)
     return;
+
+  /* ⚠ 这里拿到的 arr 是**引擎静态字段里的数组句柄**：
+   *  - 桌面(Mono) 下 patch_handle_t 是托管的弱引用 GCHandle，
+   *    释放它会让引擎侧那份引用失效 → 游戏之后读取时
+   *    SIGSEGV 在 mono_gchandle_is_in_domain（fault 0x8c）。
+   *  - Android 下 il2cpp_free 是空实现，所以历史上一直没暴露。
+   * 结论：本函数内 **一律不释放 arr**（即使是扩容前的旧句柄）。 */
   patch_handle_t arr = PATCH_NULL;
   patchlib_field_get_value(field, NULL, &arr);
   if (!patchlib_is_valid(arr)) {
-    /* 静态数组尚未初始化（C# 静态字段在类型首次访问时才创建）。
-     * 等游戏自己用到它们，再由下面的自愈逻辑补长。 */
+    /* 静态数组尚未初始化（C# 静态字段在类型首次访问时才创建）。 */
     static int warned_null = 0;
     if (warned_null < 4) {
       warned_null++;
@@ -315,19 +327,16 @@ static void prefix_set_entry(patch_handle_t field, const int type,
     if (patchlib_is_valid(bigger)) {
       patchlib_field_set_value(field, NULL, &bigger);
       TEKLOG_INFO("prefix: %s grown %zu -> %d (lazy)", name, len, need);
-      patchlib_free(arr);
-      arr = bigger;
+      arr = bigger;                    /* 旧句柄不释放（引擎可能仍持有） */
       len = patchlib_array_length(arr);
     } else {
       TEKLOG_WARN("prefix: %s grow failed (len=%zu need=%d)", name, len, need);
-      patchlib_free(arr);
       return;
     }
   }
 
   if ((size_t)type >= len) {
     TEKLOG_WARN("prefix: %s still too short (len=%zu type=%d)", name, len, type);
-    patchlib_free(arr);
     return;
   }
 
@@ -341,7 +350,6 @@ static void prefix_set_entry(patch_handle_t field, const int type,
       TEKLOG_INFO("prefix: %s[%d] = true (len=%zu)", name, type, len);
     }
   }
-  patchlib_free(arr);
 }
 
 static bool item_flag(patch_handle_t item, patch_handle_t field) {
@@ -424,11 +432,17 @@ done:
   }
 }
 
-/* 按需补归类：重铸/掷前缀时游戏会调 Item.GetRollablePrefixes()，
- * 那一刻手里是真实实例、且静态数组早已扩容完成 → 在这里补写最可靠。 */
-static bool get_rollable_prefixes_prefix(patch_handle_t instance, void **args,
-                                        const patch_method_signature_t *sig_info,
-                                        void *result);
+/* 按需归类（唯一的归类入口）：
+ * 游戏在判定重铸/掷前缀时会调用 Item.GetRollablePrefixes()，
+ * 那一刻：
+ *   - 手里是真实 Item 实例（能读到 damage/accessory 等真实属性）
+ *   - PrefixLegacy.ItemSets.* 这个静态类已经被游戏自己访问过 → 数组非 null
+ * 千万不要在 SetDefaults 里做这件事：那时静态数组还是 null，
+ * 桌面(Mono) 上 `field_get_value` 会返回"包着 null 的句柄"，
+ * 随后 array_length() 去读 null 对象 → SIGSEGV（fault 0x8c）。 */
+static void get_rollable_prefixes_postfix(patch_handle_t instance, void **args,
+                                          void *result,
+                                          const patch_method_signature_t *sig_info);
 
 static void set_defaults_postfix(patch_handle_t this, void **args, void *result,
                                  const patch_method_signature_t *sig_info) {
@@ -466,20 +480,19 @@ static void set_defaults_postfix(patch_handle_t this, void **args, void *result,
         }
     }
 
-    /* 让自定义物品在哥布林工匠处可重铸（按属性自动归类） */
-    apply_rollable_prefix(this, args_type);
-
     if (patchlib_is_valid(m_rebuild_tooltip))
         patchlib_method_invoke_args(m_rebuild_tooltip, this, PATCH_NULL, NULL);
 }
 
 /* GetRollablePrefixes 钩子：自定义物品按需补归类（数组此时已扩容） */
-static bool get_rollable_prefixes_prefix(patch_handle_t instance, void **args,
-                                        const patch_method_signature_t *sig_info,
-                                        void *result) {
-  (void)args; (void)sig_info; (void)result;
+static void get_rollable_prefixes_postfix(patch_handle_t instance, void **args,
+                                          void *result,
+                                          const patch_method_signature_t *sig_info) {
+  (void)args; (void)result; (void)sig_info;
+  if (tef_flag("no_prefix"))
+    return;
   if (!instance || !patchlib_is_valid(f_type))
-    return false;
+    return;
 
   int type = 0;
   patchlib_field_get_value(f_type, instance, &type);
@@ -487,12 +500,10 @@ static bool get_rollable_prefixes_prefix(patch_handle_t instance, void **args,
     static unsigned char hit[8192];
     if (type < (int)sizeof(hit) && !hit[type]) {
       hit[type] = 1;
-      TEKLOG_INFO("prefix: GetRollablePrefixes hook hit (type=%d)", type);
+      TEKLOG_INFO("prefix: GetRollablePrefixes postfix hit (type=%d)", type);
     }
     apply_rollable_prefix(instance, type);
   }
-
-  return false; /* 继续执行原方法 */
 }
 
 
@@ -1015,9 +1026,13 @@ static void resize_all_class_sets(const char *ns, const char *cls,
             patchlib_free(field);
             skipped++;
             skip_excluded++;
-            if (strlen(skip_sample) < 200)
-                snprintf(skip_sample + strlen(skip_sample), 200,
-                         "%s(excl) ", name ? name : "?");
+            {
+                size_t used = strlen(skip_sample);
+                if (used < sizeof(skip_sample)) {
+                    snprintf(skip_sample + used, sizeof(skip_sample) - used,
+                             "%s(excl) ", name ? name : "?");
+                }
+            }
             continue;
         }
 
@@ -1031,9 +1046,13 @@ static void resize_all_class_sets(const char *ns, const char *cls,
             patchlib_free(field);
             skipped++;
             skip_invalid++;
-            if (strlen(skip_sample) < 200)
-                snprintf(skip_sample + strlen(skip_sample), 200,
-                         "%s(null) ", name ? name : "?");
+            {
+                size_t used = strlen(skip_sample);
+                if (used < sizeof(skip_sample)) {
+                    snprintf(skip_sample + used, sizeof(skip_sample) - used,
+                             "%s(null) ", name ? name : "?");
+                }
+            }
             continue;
         }
 
@@ -1046,9 +1065,13 @@ static void resize_all_class_sets(const char *ns, const char *cls,
             patchlib_free(array);
             skipped++;
             skip_len++;
-            if (strlen(skip_sample) < 200)
-                snprintf(skip_sample + strlen(skip_sample), 200,
-                         "%s(len%zu) ", name ? name : "?", len);
+            {
+                size_t used = strlen(skip_sample);
+                if (used < sizeof(skip_sample)) {
+                    snprintf(skip_sample + used, sizeof(skip_sample) - used,
+                             "%s(len%zu) ", name ? name : "?", len);
+                }
+            }
             continue;
         }
 
@@ -1355,6 +1378,10 @@ static void setup_white_lists_postfix(patch_handle_t this, void **args,
 }
 
 void terraria_item_manager_init() {
+  if (tef_flag("no_item_hooks")) {
+    TEKLOG_WARN("tef_flag: no_item_hooks - item hooks disabled");
+    return;
+  }
     if (!tefstd_vector_init(&g_terraria_item_registry,
                             sizeof(terraria_item_handle_t *)))
         return;
@@ -1413,7 +1440,11 @@ void terraria_item_manager_init() {
     patch_handle_t get_rollable =
             patchlib_type_get_method_by_param_count(item_class, "GetRollablePrefixes", 0);
     if (patchlib_is_valid(get_rollable)) {
-      patchlib_install_prepost_hook(get_rollable, get_rollable_prefixes_prefix, NULL);
+      /* ⚠ 必须是 **postfix**：桌面加载器对"非 void 方法的 prefix 钩子"会分配
+       * 未清零的返回值缓冲（__result 为 null 时不写入），回调返回后按 GCHandle
+       * 解读那块垃圾 → mono_gchandle_is_in_domain SIGSEGV(fault 0x8c)。
+       * postfix 阶段 __result 是真实的，加载器不会读垃圾。 */
+      patchlib_install_prepost_hook(get_rollable, NULL, get_rollable_prefixes_postfix);
       TEKLOG_INFO("item_manager: hooked Item.GetRollablePrefixes");
     } else {
       TEKLOG_WARN("item_manager: Item.GetRollablePrefixes not found");

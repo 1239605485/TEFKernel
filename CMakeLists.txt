@@ -194,6 +194,17 @@ if (${ANDROID})
     target_link_options(tefkernel PRIVATE -static-libstdc++)
 endif ()
 
+# Windows(MinGW) 下把 gcc/winpthread 运行时也静态链接进 DLL，
+# 否则产物会依赖 libwinpthread-1.dll —— 玩家机器上没有就会加载失败。
+if(MINGW OR (CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_C_COMPILER_ID STREQUAL "GNU"))
+    target_link_options(tefkernel PRIVATE
+            -static-libgcc
+            -Wl,-Bstatic
+            -lwinpthread
+            -Wl,-Bdynamic
+    )
+endif()
+
 target_include_directories(tefkernel
         PUBLIC
         include

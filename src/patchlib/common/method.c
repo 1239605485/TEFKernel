@@ -207,8 +207,17 @@ bool patchlib_method_get_signature(patch_handle_t method, patch_method_signature
      * PATCH_STRUCT 分支会拿它去 il2cpp_class_get_fields()（要 Class*），
      * 喂 Type* 会取不到字段 → ffi_type 变成空结构体 → libffi 调用时
      * **不写返回缓冲** → 结构体返回值（如 Vector2）恒为调用者初始化值 (0,0)。 */
+#if defined(__ANDROID__)
+    /* Android(il2cpp)：patch_type_to_ffi_type 的 PATCH_STRUCT 分支需要 **Class\***，
+     * 传 Type* 会取不到字段 → 结构体返回值写不进调用者缓冲（Vector2 恒 (0,0)）。 */
     signature->return_type_handle =
         il2cpp_class_from_type(il2cpp_method_get_return_type(method));
+#else
+    /* 桌面(Mono)：保持原样。il2cpp_class_from_type 在这里可能返回共享弱句柄，
+     * 而 signature_free 会 free 它 → 会把引擎/loader 持有的句柄作废，
+     * 之后游戏校验 GCHandle 时 SIGSEGV（实测）。 */
+    signature->return_type_handle = il2cpp_method_get_return_type(method);
+#endif
     signature->return_type = patchlib_method_get_return_type(method);
     signature->is_instance = patchlib_method_is_instance(method);
     tefstd_vector_init(&signature->arg_types, sizeof(patch_type_t));
