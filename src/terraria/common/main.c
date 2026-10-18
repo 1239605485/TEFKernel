@@ -96,6 +96,7 @@ static void initialize_almost_everything_postfix(patch_handle_t this, void **arg
         if (!tef_flag("no_resize"))
             terraria_item_manager_init_localized_text();
         TEKLOG_INFO("Custom item localized text initialized");
+
     }
 
     // 初始化静态数据
@@ -111,6 +112,11 @@ static void initialize_almost_everything_postfix(patch_handle_t this, void **arg
     
 
     TEKLOG_INFO("Initialized %d custom items", initialized);
+
+    /* 归类"可重铸类别"：必须放在 init_static 之后 ——
+     * 加载器是在 init_static 里通过 terraria_item_manager_set_prefix_class()
+     * 用真实的 runtime_id 声明类别的。 */
+    terraria_item_manager_apply_prefix_classes();
 }
 
 void terraria_main_init(const bool is_server) {

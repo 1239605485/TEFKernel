@@ -1082,6 +1082,9 @@ void tpf_init_libtefkernel() {
     TPF_KERNEL_SYMBOL(terraria_item_manager_unregister_item_by_id);
     TPF_KERNEL_SYMBOL(terraria_item_manager_get_item);
     TPF_KERNEL_SYMBOL(terraria_item_manager_get_items);
+    /* 可重铸类别（Mod 主动声明；不声明即不可重铸） */
+    TPF_KERNEL_SYMBOL(terraria_item_manager_set_prefix_class);
+    TPF_KERNEL_SYMBOL(terraria_item_manager_apply_prefix_classes);
 
 
     // 将内核插件添加到全局列表
