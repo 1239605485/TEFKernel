@@ -49,6 +49,20 @@ void cp_call_init(JavaVM* vm) {
 }
 
 // 获取JNIEnv
+/* JNI 铁律：Java 侧抛出异常后，必须先 ExceptionClear 才能继续调用 JNI，
+ * 否则 ART 会在下一次 JNI 调用时 AssertNoPendingException → abort（SIGABRT）。
+ * 这个桥接层原来 59 处 JNI 调用、0 处异常检查 —— 任何一次文件操作失败
+ * （例如 FileNotFoundException: open failed: ENOENT）都会留下 pending 异常，
+ * 表现为"玩一会儿随机闪退"。 */
+static void clear_pending(JNIEnv* env, const char* where) {
+    if (!env)
+        return;
+    if (env->ExceptionCheck()) {
+        ALOGE("cpcall: 检测到未清理的 JNI 异常(%s)，已 ExceptionClear", where);
+        env->ExceptionClear();
+    }
+}
+
 static JNIEnv* getJNIEnv() {
     if (!g_vm) {
         ALOGE("JavaVM not initialized");
@@ -70,6 +84,7 @@ static JNIEnv* getJNIEnv() {
         return nullptr;
     }
 
+    clear_pending(env, "getJNIEnv");
     return env;
 }
 
@@ -236,6 +251,11 @@ static jobject callJavaMethodNoExtras(const char* method) {
     jstring jUriStr = env->NewStringUTF(uriStr.c_str());
     jobject uri = env->CallStaticObjectMethod(uriClass,
             env->GetStaticMethodID(uriClass, "parse", "(Ljava/lang/String;)Landroid/net/Uri;"), jUriStr);
+    if (env->ExceptionCheck()) {
+        ALOGE("cpcall: Uri.parse 抛出异常，已清理");
+        env->ExceptionClear();
+        uri = nullptr;
+    }
 
     // 调用call方法
     jclass resolverClass = env->FindClass("android/content/ContentResolver");
@@ -244,6 +264,11 @@ static jobject callJavaMethodNoExtras(const char* method) {
 
     jstring jMethod = env->NewStringUTF(method);
     jobject result = env->CallObjectMethod(resolver, callMethod, uri, jMethod, nullptr, nullptr);
+    if (env->ExceptionCheck()) {
+        ALOGE("cpcall: contentResolver.call(%s) 抛出异常，已清理并返回失败", method);
+        env->ExceptionClear();
+        result = nullptr;
+    }
 
     // 清理
     env->DeleteLocalRef(jMethod);
