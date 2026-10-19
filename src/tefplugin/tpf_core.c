@@ -811,6 +811,7 @@ tpf_register_symbol(kernel_plugin, #func, (const void *)(func))
 #include "terraria/recipe_manager.h"
 #include "terraria/language_manager.h"
 #include "terraria/item_manager.h"
+#include "terraria/projectile_manager.h"
 
 void tpf_init_libtefkernel() {
     TEKLOG_INFO("Initializing libtefkernel - creating TPF instance");
@@ -1085,6 +1086,13 @@ void tpf_init_libtefkernel() {
     /* 可重铸类别（Mod 主动声明；不声明即不可重铸） */
     TPF_KERNEL_SYMBOL(terraria_item_manager_set_prefix_class);
     TPF_KERNEL_SYMBOL(terraria_item_manager_apply_prefix_classes);
+    // projectile_manager
+    TPF_KERNEL_SYMBOL(terraria_projectile_manager_register_projectile);
+    TPF_KERNEL_SYMBOL(terraria_projectile_manager_unregister_projectile_by_id);
+    TPF_KERNEL_SYMBOL(terraria_projectile_manager_get_projectile);
+    TPF_KERNEL_SYMBOL(terraria_projectile_manager_get_projectiles);
+    TPF_KERNEL_SYMBOL(terraria_projectile_manager_find_projectile);
+    TPF_KERNEL_SYMBOL(terraria_projectile_id_get_count);
 
 
     // 将内核插件添加到全局列表

@@ -27,6 +27,7 @@
 #include "patchlib/method.h"
 
 #include "internal/terraria/item_manager.h"
+#include "internal/terraria/projectile_manager.h"
 #include "patchlib/property.h"
 
 static patch_handle_t get_graphics_device = PATCH_NULL;
@@ -38,15 +39,23 @@ static bool initialize_prefix(patch_handle_t this, void **args,
                                const patch_method_signature_t *sig_info, void *result) {
     int base_count = terraria_item_id_get_count();
     size_t custom_count = tefstd_vector_size(&g_terraria_item_registry);
+    size_t custom_proj = tefstd_vector_size(&g_terraria_projectile_registry);
 
-    TEKLOG_INFO("Main.Initialize: %d base + %zu custom items", base_count, custom_count);
+    TEKLOG_INFO("Main.Initialize: %d base + %zu custom items, %d base + %zu custom projectiles",
+                base_count, custom_count, terraria_projectile_id_get_count(), custom_proj);
 
     if (custom_count > 0) {
         terraria_item_manager_assign_ids(base_count);
         terraria_item_manager_resize();
-        TEKLOG_INFO("Assigned IDs and resized arrays");
+        TEKLOG_INFO("Assigned item IDs and resized arrays");
     }
-    
+
+    if (custom_proj > 0) {
+        terraria_projectile_manager_assign_ids(terraria_projectile_id_get_count());
+        terraria_projectile_manager_resize();
+        TEKLOG_INFO("Assigned projectile IDs and resized arrays");
+    }
+
     const size_t count = tefstd_vector_size(&g_terraria_item_registry);
     int initialized = 0;
     for (size_t i = 0; i < count; ++i) {
@@ -56,8 +65,19 @@ static bool initialize_prefix(patch_handle_t this, void **args,
             initialized++;
         }
     }
-
     TEKLOG_INFO("Initialized %d custom items", initialized);
+
+    const size_t proj_count = tefstd_vector_size(&g_terraria_projectile_registry);
+    int proj_initialized = 0;
+    for (size_t i = 0; i < proj_count; ++i) {
+        terraria_projectile_handle_t** proj_handle =
+                tefstd_vector_at(&g_terraria_projectile_registry, i);
+        if (*proj_handle && (*proj_handle)->projectile_ops.early_init) {
+            (*proj_handle)->projectile_ops.early_init(*proj_handle);
+            proj_initialized++;
+        }
+    }
+    TEKLOG_INFO("Initialized %d custom projectiles", proj_initialized);
 
     return false;
 }
@@ -69,10 +89,14 @@ static bool initialize_prefix(patch_handle_t this, void **args,
 static void initialize_postfix(patch_handle_t this, void **args, void *result,
                                const patch_method_signature_t *sig_info) {
     const size_t custom_count = tefstd_vector_size(&g_terraria_item_registry);
-    if (custom_count == 0)
+    const size_t custom_proj = tefstd_vector_size(&g_terraria_projectile_registry);
+    if (custom_count == 0 && custom_proj == 0)
         return;
     TEKLOG_INFO("Main.Initialize completed, final resizing pass...");
-    terraria_item_manager_resize();
+    if (custom_count > 0)
+        terraria_item_manager_resize();
+    if (custom_proj > 0)
+        terraria_projectile_manager_resize();
 }
 
 
@@ -81,6 +105,7 @@ static void initialize_almost_everything_postfix(patch_handle_t this, void **arg
     TEKLOG_INFO("Main.Initialize_AlmostEverything completed, resizing arrays...");
 
     size_t custom_count = tefstd_vector_size(&g_terraria_item_registry);
+    size_t custom_proj = tefstd_vector_size(&g_terraria_projectile_registry);
 
     if (custom_count > 0) {
         terraria_item_manager_resize();
@@ -96,6 +121,12 @@ static void initialize_almost_everything_postfix(patch_handle_t this, void **arg
 
     }
 
+    if (custom_proj > 0) {
+        terraria_projectile_manager_resize();
+        terraria_projectile_manager_init_texture2d();
+        TEKLOG_INFO("Custom projectile arrays resized and textures initialized");
+    }
+
     // 初始化静态数据
     const size_t count = tefstd_vector_size(&g_terraria_item_registry);
     int initialized = 0;
@@ -109,6 +140,18 @@ static void initialize_almost_everything_postfix(patch_handle_t this, void **arg
     
 
     TEKLOG_INFO("Initialized %d custom items", initialized);
+
+    const size_t proj_count = tefstd_vector_size(&g_terraria_projectile_registry);
+    int proj_initialized = 0;
+    for (size_t i = 0; i < proj_count; ++i) {
+        terraria_projectile_handle_t** proj_handle =
+                tefstd_vector_at(&g_terraria_projectile_registry, i);
+        if (*proj_handle && (*proj_handle)->projectile_ops.init_static) {
+            (*proj_handle)->projectile_ops.init_static(*proj_handle);
+            proj_initialized++;
+        }
+    }
+    TEKLOG_INFO("Initialized %d custom projectiles", proj_initialized);
 
     /* 归类"可重铸类别"：必须放在 init_static 之后 ——
      * 加载器是在 init_static 里通过 terraria_item_manager_set_prefix_class()
