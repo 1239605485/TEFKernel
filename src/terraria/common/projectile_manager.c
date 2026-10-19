@@ -21,6 +21,7 @@
 #include "patchlib/method.h"
 #include "patchlib/struct/array.h"
 #include "patchlib/type.h"
+#include "terraria/asset.h"
 #include "terraria/texture2d.h"
 
 #include <stdbool.h>
@@ -32,13 +33,61 @@ tefstd_vector_t g_terraria_projectile_registry;
 
 static patch_handle_t projectile_class = PATCH_NULL;
 static patch_handle_t f_type = PATCH_NULL;       // Projectile.type (int)
-static patch_handle_t f_ai_style = PATCH_NULL;   // Projectile.aiStyle (int)
+static patch_handle_t f_active = PATCH_NULL;     // Projectile.active (bool)
+
 static patch_handle_t projectile_id_count = PATCH_NULL;   // ProjectileID.Count (short)
 static patch_handle_t f_texture_projectile = PATCH_NULL;  // TextureAssets.Projectile
 
 static patch_hook_id_t h_set_defaults = PATCH_HOOK_INVALID_ID;
 static patch_hook_id_t h_ai = PATCH_HOOK_INVALID_ID;
 static bool g_ids_assigned = false;
+
+/* Player.UpdateProjectileCaches 会做 ownedProjectileCounts[projectile.type]++，
+ * 而游戏进入世界时会替换本地玩家实例（拿到的是原版长度的数组）。
+ * 生成自定义弹幕时顺手把玩家数组补齐，避免每帧越界（异常会被
+ * Main.cs 的 player[i].Update(i) try/catch 吞掉，表现就是"玩家被定格"）。 */
+static patch_handle_t f_main_players = PATCH_NULL;  // Main.player (Player[])
+static patch_handle_t f_owned_counts = PATCH_NULL;  // Player.ownedProjectileCounts (int[])
+
+static void ensure_player_owned_counts(const int new_size) {
+    if (!patchlib_is_valid(f_main_players) || !patchlib_is_valid(f_owned_counts))
+        return;
+    patch_handle_t players = PATCH_NULL;
+    patchlib_field_get_value(f_main_players, NULL, &players);
+    if (!patchlib_is_valid(players))
+        return;
+
+    const size_t n = patchlib_array_length(players);
+    int patched = 0;
+    for (size_t i = 0; i < n; ++i) {
+        patch_handle_t player = PATCH_NULL;
+        if (!patchlib_array_at(players, i, &player) || !patchlib_is_valid(player))
+            continue;
+
+        patch_handle_t counts = PATCH_NULL;
+        patchlib_field_get_value(f_owned_counts, player, &counts);
+        if (patchlib_is_valid(counts) &&
+            patchlib_array_length(counts) < (size_t) new_size) {
+            patch_handle_t bigger =
+                    patchlib_array_resize(counts, (size_t) new_size, NULL);
+            if (patchlib_is_valid(bigger)) {
+                patchlib_field_set_value(f_owned_counts, player, &bigger);
+                patched++;
+                patchlib_free(bigger);
+            } else {
+                TEKLOG_ERROR("projectile: ownedProjectileCounts resize 失败 (player %zu)", i);
+            }
+        }
+        if (patchlib_is_valid(counts))
+            patchlib_free(counts);
+        patchlib_free(player);
+    }
+    patchlib_free(players);
+
+    if (patched > 0)
+        TEKLOG_INFO("projectile: ownedProjectileCounts 补齐 %d 个玩家 -> %d",
+                    patched, new_size);
+}
 
 /* ------------------------------------------------------------------ */
 /* 注册表                                                              */
@@ -299,6 +348,16 @@ void terraria_projectile_manager_resize() {
             continue;
         }
         const char *name = patchlib_field_get_name(field);
+
+        // ProjectileID.Sets 里有 public const int（如 FixedDamageForRockets = 60）
+        // 这种"字段"不是数组；直接当句柄用会读 60+偏移，fault 0x8c。
+        if (!patchlib_field_is_static(field) || patchlib_field_is_const(field)) {
+            TEKLOG_DEBUG("projectile resize: skip const/non-static %s",
+                         name ? name : "?");
+            patchlib_free(field);
+            continue;
+        }
+
         if (name && (strcmp(name, "Factory") == 0 ||
                      strcmp(name, "Count") == 0)) {
             patchlib_free(field);
@@ -318,10 +377,14 @@ void terraria_projectile_manager_resize() {
                 fill_new_slots_with_modal(array, bigger, len, (size_t) new_size);
                 patchlib_field_set_value(field, NULL, &bigger);
                 resized++;
+                patchlib_free(bigger);
             } else {
-                TEKLOG_ERROR("projectile resize: %s failed",
-                             name ? name : "?");
+                TEKLOG_ERROR("projectile resize: %s (%zu -> %d) 失败",
+                             name ? name : "?", len, new_size);
             }
+        } else {
+            TEKLOG_DEBUG("projectile resize: %s len=%zu != base=%d，跳过",
+                         name ? name : "?", len, base);
         }
         patchlib_free(array);
         patchlib_free(field);
@@ -424,7 +487,18 @@ static patch_handle_t make_placeholder_texture() {
     patch_handle_t tex = terraria_texture2d_create(
             SIZE, SIZE, TEXTURE_FORMAT_RGBA32, px, DATA);
     free(px);
-    return tex;
+    if (!patchlib_is_valid(tex))
+        return PATCH_NULL;
+
+    /* TextureAssets.Projectile[] 的元素是 Asset<Texture2D>，必须包一层，
+     * 否则游戏读 .Value 时拿到的是 Texture2D 对象 → 画不出来（或崩）。 */
+    patch_handle_t tex_type = terraria_texture2d_get_class();
+    patch_handle_t asset = terraria_asset_create(tex_type, tex);
+    if (patchlib_is_valid(tex_type))
+        patchlib_free(tex_type);
+    if (patchlib_is_valid(tex))
+        patchlib_free(tex);
+    return asset;
 }
 
 void terraria_projectile_manager_init_texture2d() {
@@ -486,13 +560,30 @@ static void set_defaults_postfix(patch_handle_t this, void **args, void *result,
     if (nid < 0 || nid >= (int) count)
         return;
 
-    /* SetDefaults 内部可能清空 type，强制恢复 */
+    /* SetDefaults 内部可能清空/改写 type，强制恢复 */
+    int current_type = 0;
+    patchlib_field_get_value(f_type, this, &current_type);
+    if (current_type != type)
+        TEKLOG_WARN("projectile SetDefaults 改写了 type：%d -> %d，已恢复",
+                    type, current_type);
     patchlib_field_set_value(f_type, this, args[0]);
+    TEKLOG_INFO("projectile set_defaults_postfix: custom nid=%d, applying defaults",
+                nid);
+
+    /* 原版 SetDefaults 末尾的 else 分支会把未知类型置为 active=false，
+     * 自定义弹幕必须在这里重新激活，否则创建后立即失活（不更新、不绘制）。 */
+    const bool active = true;
+    patchlib_field_set_value(f_active, this, (void *) &active);
+
+    /* 玩家侧缓存：ownedProjectileCounts 会被 Player.UpdateProjectileCaches
+     * 按弹幕 type 索引，进入世界后玩家实例可能已换，这里按需补齐。 */
+    ensure_player_owned_counts(base + (int) count);
 
     terraria_projectile_handle_t **pp =
             tefstd_vector_at(&g_terraria_projectile_registry, (size_t) nid);
     if (pp && *pp && (*pp)->projectile_ops.set_defaults)
         (*pp)->projectile_ops.set_defaults(*pp, this);
+
 }
 
 static bool ai_prefix(patch_handle_t this, void **args,
@@ -508,6 +599,7 @@ static bool ai_prefix(patch_handle_t this, void **args,
     const int base = terraria_projectile_id_get_count();
     const int nid = type - base;
     const size_t count = tefstd_vector_size(&g_terraria_projectile_registry);
+
     if (nid < 0 || nid >= (int) count)
         return false; /* 原版弹幕：走原版 AI */
 
@@ -538,7 +630,20 @@ void terraria_projectile_manager_init() {
     }
 
     f_type = patchlib_type_get_field(projectile_class, "type");
-    f_ai_style = patchlib_type_get_field(projectile_class, "aiStyle");
+    f_active = patchlib_type_get_field(projectile_class, "active");
+
+    /* 玩家侧缓存字段（见 ensure_player_owned_counts） */
+    patch_handle_t main_cls = patchlib_type_get_type("Terraria", "Main");
+    if (patchlib_is_valid(main_cls)) {
+        f_main_players = patchlib_type_get_field(main_cls, "player");
+        patchlib_free(main_cls);
+    }
+    patch_handle_t player_cls = patchlib_type_get_type("Terraria", "Player");
+    if (patchlib_is_valid(player_cls)) {
+        f_owned_counts =
+                patchlib_type_get_field(player_cls, "ownedProjectileCounts");
+        patchlib_free(player_cls);
+    }
 
     patch_handle_t id_cls = patchlib_type_get_type("Terraria.ID", "ProjectileID");
     if (patchlib_is_valid(id_cls)) {
