@@ -21,7 +21,6 @@
  *******************************************************************************/
 
 #include "internal/terraria/recipe_manager.h"
-#include "internal/flags.h"
 #include "internal/log.h"
 
 #include "patchlib/field.h"
@@ -72,10 +71,6 @@ setup_recipes_prefix(patch_handle_t this, void **args,
 }
 
 void terraria_recipe_manager_init() {
-  if (tef_flag("no_recipe")) {
-    TEKLOG_WARN("tef_flag: no_recipe - recipe hooks disabled");
-    return;
-  }
     tefstd_vector_init(&g_recipe_callback,
                        sizeof(terraria_recipe_manager_addrecipes_t));
 

@@ -21,7 +21,6 @@
  *******************************************************************************/
 
 #include "patchlib/field.h"
-#include "internal/flags.h"
 #include "internal/terraria/main.h"
 
 #include "internal/log.h"
@@ -42,7 +41,7 @@ static bool initialize_prefix(patch_handle_t this, void **args,
 
     TEKLOG_INFO("Main.Initialize: %d base + %zu custom items", base_count, custom_count);
 
-    if (custom_count > 0 && !tef_flag("no_resize")) {
+    if (custom_count > 0) {
         terraria_item_manager_assign_ids(base_count);
         terraria_item_manager_resize();
         TEKLOG_INFO("Assigned IDs and resized arrays");
@@ -73,8 +72,7 @@ static void initialize_postfix(patch_handle_t this, void **args, void *result,
     if (custom_count == 0)
         return;
     TEKLOG_INFO("Main.Initialize completed, final resizing pass...");
-    if (!tef_flag("no_resize"))
-        terraria_item_manager_resize();
+    terraria_item_manager_resize();
 }
 
 
@@ -84,7 +82,7 @@ static void initialize_almost_everything_postfix(patch_handle_t this, void **arg
 
     size_t custom_count = tefstd_vector_size(&g_terraria_item_registry);
 
-    if (custom_count > 0 && !tef_flag("no_resize")) {
+    if (custom_count > 0) {
         terraria_item_manager_resize();
         terraria_item_manager_init_texture2d();
         TEKLOG_INFO("Arrays resized and textures initialized");
@@ -93,8 +91,7 @@ static void initialize_almost_everything_postfix(patch_handle_t this, void **arg
         // 早于 Main.Initialize），early_init 注册的语言回调也已就绪；
         // 若文本尚未载入，Language.GetText 会创建占位对象，后续语言加载时
         // 会原地更新同一个对象，因此这里填充是安全且可自愈的。
-        if (!tef_flag("no_resize"))
-            terraria_item_manager_init_localized_text();
+        terraria_item_manager_init_localized_text();
         TEKLOG_INFO("Custom item localized text initialized");
 
     }

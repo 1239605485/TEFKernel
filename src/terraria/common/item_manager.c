@@ -21,7 +21,6 @@
  *******************************************************************************/
 
 #include "internal/terraria/item_manager.h"
-#include "internal/flags.h"
 #include "terraria/language_manager.h"
 #include "terraria/recipe_manager.h"
 
@@ -1388,10 +1387,6 @@ static void setup_white_lists_postfix(patch_handle_t this, void **args,
 }
 
 void terraria_item_manager_init() {
-  if (tef_flag("no_item_hooks")) {
-    TEKLOG_WARN("tef_flag: no_item_hooks - item hooks disabled");
-    return;
-  }
     if (!tefstd_vector_init(&g_terraria_item_registry,
                             sizeof(terraria_item_handle_t *)))
         return;
