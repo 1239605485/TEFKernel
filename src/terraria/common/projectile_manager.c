@@ -48,6 +48,7 @@ static bool g_ids_assigned = false;
  * Main.cs 的 player[i].Update(i) try/catch 吞掉，表现就是"玩家被定格"）。 */
 static patch_handle_t f_main_players = PATCH_NULL;  // Main.player (Player[])
 static patch_handle_t f_owned_counts = PATCH_NULL;  // Player.ownedProjectileCounts (int[])
+static patch_handle_t f_proj_frames = PATCH_NULL;   // Main.projFrames (int[])
 
 static void ensure_player_owned_counts(const int new_size) {
     if (!patchlib_is_valid(f_main_players) || !patchlib_is_valid(f_owned_counts))
@@ -409,8 +410,11 @@ void terraria_projectile_manager_resize() {
         patch_handle_t field = patchlib_type_get_field(main_cls, main_fields[i]);
         if (!patchlib_is_valid(field))
             continue;
+        if (i == 0 && !patchlib_is_valid(f_proj_frames))
+            f_proj_frames = field;   /* 保留句柄给帧图写入用 */
         resize_static_array(field, main_fields[i], base, new_size);
-        patchlib_free(field);
+        if (!(i == 0 && patchlib_is_valid(f_proj_frames) && f_proj_frames == field))
+            patchlib_free(field);
     }
 
     /* 4) Player.ownedProjectileCounts（Player.Update 里按 projectile.type 自增） */
@@ -632,6 +636,22 @@ static void set_defaults_postfix(patch_handle_t this, void **args, void *result,
 
     /* ai / localAI 若为空，原版 AI 一进来就会空指针，这里提前补好 */
     ensure_projectile_ai_arrays(this);
+
+    /* 帧图：声明了帧数就把 Main.projFrames[type] 写上（0 = 单帧整图不写）。
+     * projFrames 是 int[] 静态数组：先取数组对象，再写第 type 个元素。 */
+    {
+        terraria_projectile_handle_t **fp =
+                tefstd_vector_at(&g_terraria_projectile_registry, (size_t) nid);
+        if (fp && *fp && (*fp)->frames > 0 && patchlib_is_valid(f_proj_frames)) {
+            patch_handle_t arr = PATCH_NULL;
+            patchlib_field_get_value(f_proj_frames, NULL, &arr);
+            if (patchlib_is_valid(arr) &&
+                (size_t) type < patchlib_array_length(arr)) {
+                int frames = (*fp)->frames;
+                patchlib_array_set(arr, (size_t) type, &frames);
+            }
+        }
+    }
 
     /* 玩家侧缓存：ownedProjectileCounts 会被 Player.UpdateProjectileCaches
      * 按弹幕 type 索引，进入世界后玩家实例可能已换，这里按需补齐。 */

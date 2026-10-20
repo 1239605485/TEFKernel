@@ -191,6 +191,7 @@ static patch_handle_t f_type = PATCH_NULL;
 static patch_handle_t f_stack = PATCH_NULL;
 static patch_handle_t m_reset_stats = PATCH_NULL;
 static patch_handle_t m_rebuild_tooltip = PATCH_NULL; // void RebuildTooltip()
+static patch_handle_t f_item_animations = PATCH_NULL; // Main.itemAnimations (DrawAnimation[])
 
 static patch_handle_t f_texture_item = PATCH_NULL;
 static patch_handle_t f_texture_item_flame = PATCH_NULL;
@@ -398,6 +399,130 @@ static void prefix_set_entry(patch_handle_t field, const int type,
 }
 
 
+/* 确保 Main.itemAnimations 句柄可用；返回 false = 无法验证（此时别乱注册） */
+static bool ensure_item_animations_handle(void) {
+    if (patchlib_is_valid(f_item_animations))
+        return true;
+    patch_handle_t main_cls = patchlib_type_get_type("Terraria", "Main");
+    if (!patchlib_is_valid(main_cls))
+        return false;
+    f_item_animations =
+            patchlib_type_get_field(main_cls, "itemAnimations");
+    patchlib_free(main_cls);
+    return patchlib_is_valid(f_item_animations);
+}
+
+/* 保证 Main.itemAnimations 至少 need+1 长（注册自定义 id 前必须先扩容，
+ * 否则 itemAnimations[index] = anim 会 IndexOutOfRangeException） */
+static bool ensure_item_animations_length(int need) {
+    if (!ensure_item_animations_handle())
+        return false;
+    patch_handle_t arr = PATCH_NULL;
+    patchlib_field_get_value(f_item_animations, NULL, &arr);
+    if (!patchlib_is_valid(arr))
+        return false;
+    if ((size_t) need >= patchlib_array_length(arr)) {
+        patch_handle_t bigger =
+                patchlib_array_resize(arr, (size_t) need + 1, NULL);
+        if (!patchlib_is_valid(bigger)) {
+            TEKLOG_ERROR("item anim: itemAnimations grow failed (need=%d)", need);
+            return false;
+        }
+        patchlib_field_set_value(f_item_animations, NULL, &bigger);
+        patchlib_free(bigger);
+        TEKLOG_INFO("item anim: itemAnimations grown to %d", need + 1);
+    }
+    return true;
+}
+
+/* itemAnimations[type] 是否已有动画对象。
+ * 游戏的 InitializeItemAnimations() 会整表清空后只重注册原版动画，
+ * 所以自定义物品的注册不能只做一次，要按现状自愈。 */
+static bool item_animation_registered(int type) {
+    if (!ensure_item_animations_handle())
+        return true; /* 无法验证：当作已注册，避免反复重建 */
+    patch_handle_t arr = PATCH_NULL;
+    patchlib_field_get_value(f_item_animations, NULL, &arr);
+    if (!patchlib_is_valid(arr))
+        return true;
+    bool has = true;
+    if ((size_t) type < patchlib_array_length(arr)) {
+        patch_handle_t v = PATCH_NULL;
+        has = patchlib_array_at(arr, (size_t) type, &v) && patchlib_is_valid(v);
+    }
+    return has;
+}
+
+/* 给物品注册 DrawAnimationVertical 帧动画 */
+static void register_item_animation(terraria_item_handle_t *ih, int type) {
+    if (!ensure_item_animations_length(type))
+        return;
+
+    patch_handle_t anim_cls = patchlib_type_get_type(
+            "Terraria.DataStructures", "DrawAnimationVertical");
+    if (!patchlib_is_valid(anim_cls)) {
+        TEKLOG_WARN("item anim: DrawAnimationVertical not found");
+        return;
+    }
+
+    patch_handle_t ctor =
+            patchlib_type_get_method_by_param_count(anim_cls, ".ctor", 3);
+    if (patchlib_is_valid(ctor)) {
+        const int ticks = ih->anim_ticks > 0 ? ih->anim_ticks : 8;
+        const int frames = ih->anim_frames;
+        unsigned char pingpong = 0;
+        void *ca[3] = {&ticks, &frames, &pingpong};
+        patch_handle_t anim = PATCH_NULL;
+        if (patchlib_constructor_invoke(ctor, &anim, ca) &&
+            patchlib_is_valid(anim)) {
+            patch_handle_t main_cls = patchlib_type_get_type("Terraria", "Main");
+            patch_handle_t reg = patchlib_is_valid(main_cls)
+                    ? patchlib_type_get_method_by_param_count(
+                              main_cls, "RegisterItemAnimation", 2)
+                    : PATCH_NULL;
+            if (patchlib_is_valid(reg)) {
+                void *ra[2] = {&type, &anim};
+                if (patchlib_method_invoke_args(reg, NULL, NULL, ra)) {
+                    ih->anim_registered = true;
+                    TEKLOG_INFO("item anim: %s registered "
+                                "(%d frames / %d ticks, type=%d)",
+                                ih->internal_name ? ih->internal_name : "?",
+                                frames, ticks, type);
+                } else {
+                    TEKLOG_WARN("item anim: %s RegisterItemAnimation 失败",
+                                ih->internal_name ? ih->internal_name : "?");
+                }
+                patchlib_free(reg);
+            }
+            patchlib_free(main_cls);
+            /* 动画对象所有权交给引擎数组；注册失败的对象这里没有根，
+             * Android 下 free 是空操作，桌面由 GC 回收 */
+        }
+        patchlib_free(ctor);
+    }
+    patchlib_free(anim_cls);
+}
+
+/* Main.InitializeItemAnimations postfix：游戏清空动画表后，把自定义物品的
+ * 动画重新注册回去 */
+static void initialize_item_animations_postfix(patch_handle_t this, void **args,
+                                               void *result,
+                                               const patch_method_signature_t *sig_info) {
+    (void) this; (void) args; (void) result; (void) sig_info;
+    const size_t count = tefstd_vector_size(&g_terraria_item_registry);
+    for (size_t i = 0; i < count; ++i) {
+        terraria_item_handle_t **pp =
+                tefstd_vector_at(&g_terraria_item_registry, i);
+        if (!pp || !*pp)
+            continue;
+        terraria_item_handle_t *ih = *pp;
+        if (ih->anim_frames <= 0 || ih->runtime_id < 0)
+            continue;
+        if (!item_animation_registered(ih->runtime_id))
+            register_item_animation(ih, ih->runtime_id);
+    }
+}
+
 /* 每个类型只打一次归类日志（set_defaults 会被频繁调用） */
 static unsigned char g_prefix_logged[8192];
 
@@ -508,6 +633,15 @@ static void set_defaults_postfix(patch_handle_t this, void **args, void *result,
         if (item_handle->item_ops.set_defaults) {
             item_handle->item_ops.set_defaults(item_handle, this);
         }
+    }
+
+    /* 帧动画：物品声明了 anim_frames 就按需注册。
+     * 注意游戏 InitializeItemAnimations() 会把 itemAnimations 整表清空，
+     * 所以这里不能靠一次性标志，而是查现状：槽位为空才注册（自愈）。 */
+    if (item_handle_ptr && *item_handle_ptr) {
+        terraria_item_handle_t *ih = *item_handle_ptr;
+        if (ih->anim_frames > 0 && !item_animation_registered(args_type))
+            register_item_animation(ih, args_type);
     }
 
     if (patchlib_is_valid(m_rebuild_tooltip))
@@ -1435,6 +1569,25 @@ void terraria_item_manager_init() {
             patchlib_type_get_method_by_param_count(item_class, "SetDefaults", 2);
 
     patchlib_install_prepost_hook(set_defaults, NULL, set_defaults_postfix);
+
+    /* 游戏会在 Initialize_AlmostEverything 里清空 itemAnimations 整表，
+     * 自定义物品的帧动画要在它之后重新注册 */
+    {
+        patch_handle_t main_cls = patchlib_type_get_type("Terraria", "Main");
+        patch_handle_t init_anims = patchlib_is_valid(main_cls)
+                ? patchlib_type_get_method_by_param_count(main_cls,
+                                                          "InitializeItemAnimations", 0)
+                : PATCH_NULL;
+        if (patchlib_is_valid(init_anims)) {
+            patchlib_install_prepost_hook(init_anims, NULL,
+                                          initialize_item_animations_postfix);
+            TEKLOG_INFO("item anim: hooked Main.InitializeItemAnimations");
+        } else {
+            TEKLOG_WARN("item anim: InitializeItemAnimations not found");
+        }
+        if (patchlib_is_valid(main_cls))
+            patchlib_free(main_cls);
+    }
 
     /* 只解析句柄，**不挂钩子**：
      * 这个方法的调用时机（掷前缀，例如挖掉方块掉落物品时）恰好是崩溃高发点，
