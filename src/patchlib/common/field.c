@@ -221,6 +221,7 @@ size_t patchlib_field_get_size(patch_handle_t field) {
             break; // double
         case IL2CPP_TYPE_VALUETYPE:
             result = il2cpp_class_value_size(il2cpp_class_from_il2cpp_type(field_type), NULL);
+            break;
         default:
             result = sizeof(void *);
             break;

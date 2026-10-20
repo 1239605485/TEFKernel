@@ -79,6 +79,12 @@ static bool is_element_size_valid(size_t element_size) {
     return true;
 }
 
+size_t patchlib_array_element_size(patch_handle_t array) {
+    if (!patchlib_is_valid(array))
+        return 0;
+    return get_array_element_size(array);
+}
+
 bool patchlib_array_at(patch_handle_t array, const size_t index, void* out_value) {
     if (!patchlib_is_valid(array)) {
         TEKLOG_ERROR("Invalid array handle");

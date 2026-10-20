@@ -132,6 +132,18 @@ void * patchlib_field_get_pointer(patch_handle_t field, void *instance) {
         return (void*)((uintptr_t)staticData + offset);
     }
 
-    const bool isValueType = il2cpp_type_get_type(p_class) == IL2CPP_TYPE_VALUETYPE;
-    return (void*)((uintptr_t)instance + offset - (isValueType ? sizeof(void*) * 2 : 0x0));
+    /* 实例字段必须给 instance。否则下面会算出 NULL + offset（例如 0x12f），
+     * 调用方再 memcpy 就是 SIGSEGV，而且故障地址看起来像随机数。
+     * 这里直接返回 NULL，由 patchlib_field_get_value/set_value 统一处理。 */
+    if (!instance) {
+        const char *fname = patchlib_field_get_name(field);
+        TEKLOG_ERROR("Instance is NULL for non-static field '%s'", fname ? fname : "?");
+        return NULL;
+    }
+
+    /* 旧代码把 il2cpp_field_get_parent() 返回的 Il2CppClass* 直接传给
+     * il2cpp_type_get_type()，读的是类对象里的 gc_desc 字节；约 1/256 的类
+     * 会随机命中 IL2CPP_TYPE_VALUETYPE，导致该类的所有实例字段地址偏移 -16。
+     * 内核拿到的 instance 都是类对象指针（不是装箱结构体），这里不做修正。 */
+    return (void*)((uintptr_t)instance + offset);
 }

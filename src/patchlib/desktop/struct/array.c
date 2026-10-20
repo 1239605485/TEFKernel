@@ -29,6 +29,14 @@
 #include <string.h>
 #include "../../il2cpp_api.h"
 
+size_t patchlib_array_element_size(patch_handle_t array) {
+    if (!patchlib_is_valid(array))
+        return 0;
+    /* 桌面端：数组对象的类就是其元素类型对应的数组类 */
+    const int size = il2cpp_array_element_size(il2cpp_object_get_class(array));
+    return size > 0 ? (size_t) size : 0;
+}
+
 bool patchlib_array_at(patch_handle_t array, const size_t index, void *out_value) {
     TEKLOG_DEBUG("patchlib_array_at called: array=%p, index=%zu, out_value=%p",
                  array, index, out_value);

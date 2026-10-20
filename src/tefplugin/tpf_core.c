@@ -1000,6 +1000,7 @@ void tpf_init_libtefkernel() {
     TPF_KERNEL_SYMBOL(patchlib_array_fill);
     TPF_KERNEL_SYMBOL(patchlib_array_empty);
     TPF_KERNEL_SYMBOL(patchlib_array_length);
+    TPF_KERNEL_SYMBOL(patchlib_array_element_size);
 
     // 集合操作API - List
     TPF_KERNEL_SYMBOL(patchlib_list_create);
