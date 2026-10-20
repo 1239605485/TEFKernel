@@ -35,7 +35,16 @@ typedef struct terraria_projectile_ops_t {
     void (*set_defaults)(terraria_projectile_handle_t *current, patch_handle_t instance);
 
     /**
-     * @brief 每帧 AI。返回后内核会**跳过原版 AI**。
+     * @brief 每帧 AI。
+     *
+     * 默认（ai_after_vanilla = false）：调用后内核会**跳过原版 AI**，
+     * 位移/重力/旋转都要在回调里自己做。
+     *
+     * ai_after_vanilla = true 时：先让原版 AI（按 aiStyle）完整执行，
+     * 内核再调用本回调，用于在 vanilla 行为之上补逻辑。
+     *
+     * 该机制只依赖内核本身（与具体扩展/加载器无关）：
+     * 任何扩展注册的弹幕都可以选择「替换」或「补在 vanilla 之后」。
      * @warning instance 由 hook 管理器释放，不要持有
      */
     void (*ai)(terraria_projectile_handle_t *current, patch_handle_t instance);
@@ -52,6 +61,7 @@ typedef struct terraria_projectile_handle_t {
     const char *internal_name;        //<< 内部名称
     int runtime_id;                   //<< 由内核分配
     bool no_ai_hook;                  //<< true = 不接管 AI（沿用原版 aiStyle）
+    bool ai_after_vanilla;            //<< true = 原版 AI 先执行，再调用扩展 ai 回调
     terraria_projectile_ops_t projectile_ops;
 } terraria_projectile_handle_t;
 

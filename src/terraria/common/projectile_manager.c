@@ -365,7 +365,7 @@ void terraria_projectile_manager_resize() {
         }
         patch_handle_t array = PATCH_NULL;
         patchlib_field_get_value(field, NULL, &array);
-        if (!patchlib_is_valid(array)) {
+        if (!array) {
             patchlib_free(field);
             continue;
         }
@@ -429,12 +429,11 @@ void terraria_projectile_manager_resize() {
             int patched = 0;
             for (size_t i = 0; i < n; ++i) {
                 patch_handle_t player = PATCH_NULL;
-                if (!patchlib_array_at(players, i, &player) ||
-                    !patchlib_is_valid(player))
+                if (!patchlib_array_at(players, i, &player) || !player)
                     continue;
                 patch_handle_t counts = PATCH_NULL;
                 patchlib_field_get_value(f_owned, player, &counts);
-                if (patchlib_is_valid(counts) &&
+                if (counts &&
                     patchlib_array_length(counts) == (size_t) base) {
                     patch_handle_t bigger = patchlib_array_resize(
                             counts, (size_t) new_size, NULL);
@@ -547,6 +546,62 @@ void terraria_projectile_manager_init_texture2d() {
 /* 钩子                                                                */
 /* ------------------------------------------------------------------ */
 
+/**
+ * 自定义弹幕的 ai / localAI 数组在部分平台（对象池/未初始化分配）上可能是空的。
+ * 原版 AI 一进来就会读写 ai[]，空指针会直接抛异常，所以必须在 SetDefaults
+ * 阶段就把数组补出来（与具体扩展无关，属于内核职责）。
+ */
+static void ensure_projectile_ai_arrays(patch_handle_t inst) {
+    static patch_handle_t f_ai = PATCH_NULL;
+    static patch_handle_t f_local_ai = PATCH_NULL;
+    static patch_handle_t f_max_ai = PATCH_NULL;
+    static bool resolved = false;
+
+    if (!resolved) {
+        resolved = true;
+        patch_handle_t cls = patchlib_type_get_type("Terraria", "Projectile");
+        if (patchlib_is_valid(cls)) {
+            f_ai = patchlib_type_get_field(cls, "ai");
+            f_local_ai = patchlib_type_get_field(cls, "localAI");
+            f_max_ai = patchlib_type_get_field(cls, "maxAI");
+            patchlib_free(cls);
+        }
+    }
+
+    if (!patchlib_is_valid(f_ai) || !patchlib_is_valid(f_local_ai))
+        return;
+
+    /* PE 的 ai / localAI 是 12 字节内联结构（Float_FixedArray_3），
+     * 不是 float[]；往里写托管数组指针会破坏 ai[0]/ai[1]。 */
+    if (patchlib_field_get_type(f_ai) != PATCH_OBJECT)
+        return;
+
+    int n = 3;
+    if (patchlib_is_valid(f_max_ai))
+        patchlib_field_get_value(f_max_ai, NULL, &n);
+    if (n < 1) n = 3;
+
+    patch_handle_t float_type = patchlib_get_basic_type(PATCH_FLOAT);
+    if (!patchlib_is_valid(float_type))
+        return;
+
+    patch_handle_t arr = PATCH_NULL;
+    patchlib_field_get_value(f_ai, inst, &arr);
+    if (!patchlib_is_valid(arr)) {
+        arr = patchlib_array_create((size_t) n, float_type);
+        if (patchlib_is_valid(arr))
+            patchlib_field_set_value(f_ai, inst, &arr);
+    }
+
+    arr = PATCH_NULL;
+    patchlib_field_get_value(f_local_ai, inst, &arr);
+    if (!patchlib_is_valid(arr)) {
+        arr = patchlib_array_create((size_t) n, float_type);
+        if (patchlib_is_valid(arr))
+            patchlib_field_set_value(f_local_ai, inst, &arr);
+    }
+}
+
 static void set_defaults_postfix(patch_handle_t this, void **args, void *result,
                                  const patch_method_signature_t *sig_info) {
     (void) result;
@@ -574,6 +629,9 @@ static void set_defaults_postfix(patch_handle_t this, void **args, void *result,
      * 自定义弹幕必须在这里重新激活，否则创建后立即失活（不更新、不绘制）。 */
     const bool active = true;
     patchlib_field_set_value(f_active, this, (void *) &active);
+
+    /* ai / localAI 若为空，原版 AI 一进来就会空指针，这里提前补好 */
+    ensure_projectile_ai_arrays(this);
 
     /* 玩家侧缓存：ownedProjectileCounts 会被 Player.UpdateProjectileCaches
      * 按弹幕 type 索引，进入世界后玩家实例可能已换，这里按需补齐。 */
@@ -611,8 +669,44 @@ static bool ai_prefix(patch_handle_t this, void **args,
     if (h->no_ai_hook || !h->projectile_ops.ai)
         return false; /* 沿用原版 aiStyle */
 
+    if (h->ai_after_vanilla)
+        return false; /* 先让原版 AI 跑完，ai_postfix 再调用扩展回调 */
+
     h->projectile_ops.ai(h, this);
     return true; /* 跳过原版 AI */
+}
+
+/**
+ * 后置 AI 钩子：只处理 ai_after_vanilla 模式。
+ * 原版 Projectile.AI()（aiStyle）已经执行完毕，这里再调扩展注册的回调，
+ * 扩展只需补充 vanilla 没有的行为（拾取、Buff、额外重力等）。
+ */
+static void ai_postfix(patch_handle_t this, void **args, void *result,
+                       const patch_method_signature_t *sig_info) {
+    (void) args;
+    (void) result;
+    (void) sig_info;
+    if (!this || !patchlib_is_valid(f_type))
+        return;
+
+    int type = 0;
+    patchlib_field_get_value(f_type, this, &type);
+    const int base = terraria_projectile_id_get_count();
+    const int nid = type - base;
+    const size_t count = tefstd_vector_size(&g_terraria_projectile_registry);
+
+    if (nid < 0 || nid >= (int) count)
+        return;
+
+    terraria_projectile_handle_t **pp =
+            tefstd_vector_at(&g_terraria_projectile_registry, (size_t) nid);
+    if (!pp || !*pp)
+        return;
+    terraria_projectile_handle_t *h = *pp;
+    if (h->no_ai_hook || !h->ai_after_vanilla || !h->projectile_ops.ai)
+        return;
+
+    h->projectile_ops.ai(h, this);
 }
 
 /* ------------------------------------------------------------------ */
@@ -673,7 +767,7 @@ void terraria_projectile_manager_init() {
     patch_handle_t ai = patchlib_type_get_method_by_param_count(
             projectile_class, "AI", 0);
     if (patchlib_is_valid(ai)) {
-        h_ai = patchlib_install_prepost_hook(ai, ai_prefix, NULL);
+        h_ai = patchlib_install_prepost_hook(ai, ai_prefix, ai_postfix);
         TEKLOG_INFO("projectile: hooked Projectile.AI (%d)", (int) h_ai);
     }
 
