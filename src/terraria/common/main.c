@@ -46,7 +46,9 @@ static bool initialize_prefix(patch_handle_t this, void **args,
 
     if (custom_count > 0) {
         terraria_item_manager_assign_ids(base_count);
-        terraria_item_manager_resize();
+        /* 前缀阶段只扩容已存在的数组；Lang 缓存等还没初始化，
+         * 创建了也会被游戏初始化覆盖，留到后面的兜底 pass。 */
+        terraria_item_manager_resize(false);
         TEKLOG_INFO("Assigned item IDs and resized arrays");
     }
 
@@ -94,7 +96,7 @@ static void initialize_postfix(patch_handle_t this, void **args, void *result,
         return;
     TEKLOG_INFO("Main.Initialize completed, final resizing pass...");
     if (custom_count > 0)
-        terraria_item_manager_resize();
+        terraria_item_manager_resize(true);
     if (custom_proj > 0)
         terraria_projectile_manager_resize();
 }
@@ -108,7 +110,7 @@ static void initialize_almost_everything_postfix(patch_handle_t this, void **arg
     size_t custom_proj = tefstd_vector_size(&g_terraria_projectile_registry);
 
     if (custom_count > 0) {
-        terraria_item_manager_resize();
+        terraria_item_manager_resize(true);
         terraria_item_manager_init_texture2d();
         TEKLOG_INFO("Arrays resized and textures initialized");
 

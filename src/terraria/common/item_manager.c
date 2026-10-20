@@ -876,7 +876,8 @@ static int compare_item(const void *a, const void *b) {
 // 初始化
 
 static void resize_array(const char *ns, const char *cls, const char *fid,
-                         patch_handle_t type, int nsize, void *dvalue);
+                         patch_handle_t type, int nsize, void *dvalue,
+                         const bool allow_create);
 
 #if !__ANDROID__
 // PC端：AssetInitializer.LoadTextures 会按 TextureAssets.Item 的新长度遍历，
@@ -1049,7 +1050,7 @@ static void resize_all_class_sets(const char *ns, const char *cls,
         patch_handle_t array = PATCH_NULL;
         patchlib_field_get_value(field, NULL, &array);
 
-        if (!patchlib_is_valid(array)) {
+        if (!array) {
             TEKLOG_DEBUG("resize_all_itemid_sets: invalid array for %s",
                          name ? name : "?");
             patchlib_free(field);
@@ -1133,7 +1134,7 @@ static void resize_all_itemid_sets(const int base_count, const int new_size) {
 // 绘制自定义物品图标（ItemSlot.DrawItemIcon / Main.LoadItem /
 // 更新动画等）时会按 type 索引，必须同步扩容。 新增区域为
 // null，表示自定义物品没有动画帧，符合预期。
-static void resize_item_animations(const int new_size) {
+static void resize_item_animations(const int new_size, const bool allow_create) {
     patch_handle_t draw_animation_class =
             patchlib_type_get_type("Terraria.DataStructures", "DrawAnimation");
     if (!patchlib_is_valid(draw_animation_class)) {
@@ -1151,7 +1152,7 @@ static void resize_item_animations(const int new_size) {
     patch_handle_t field = patchlib_type_get_field(main_class, "itemAnimations");
     if (patchlib_is_valid(field)) {
         resize_array("Terraria", "Main", "itemAnimations", draw_animation_class,
-                     new_size, NULL);
+                     new_size, NULL, allow_create);
         patchlib_free(field);
     } else {
         TEKLOG_ERROR(
@@ -1166,7 +1167,8 @@ static void resize_item_animations(const int new_size) {
 // GetTooltip 无边界检查，自定义物品悬停取 tooltip 时直接越界。
 // 扩容后 _itemTooltipCache 新槽位填充 ItemTooltip.None，避免返回 null 引发
 // NRE。
-static void resize_lang_caches(const int base_count, const int new_size) {
+static void resize_lang_caches(const int base_count, const int new_size,
+                               const bool allow_create) {
     patch_handle_t tooltip_class =
             patchlib_type_get_type("Terraria.UI", "ItemTooltip");
     patch_handle_t name_class =
@@ -1188,9 +1190,9 @@ static void resize_lang_caches(const int base_count, const int new_size) {
     // 新槽位必须填充 ItemTooltip.None，否则 Lang.GetTooltip() 会返回 null，
     // 经 Item.RebuildTooltip() 写入 ToolTip 后在渲染提示时 NRE。
     resize_array("Terraria", "Lang", "_itemTooltipCache", tooltip_class,
-                 new_size, patchlib_is_valid(none) ? &none : NULL);
+                 new_size, none ? &none : NULL, allow_create);
 
-    if (patchlib_is_valid(none))
+    if (none)
         patchlib_free(none);
     if (patchlib_is_valid(f_none))
         patchlib_free(f_none);
@@ -1202,8 +1204,8 @@ static void resize_lang_caches(const int base_count, const int new_size) {
     if (patchlib_is_valid(f_empty))
         patchlib_field_get_value(f_empty, NULL, &empty);
     resize_array("Terraria", "Lang", "_itemNameCache", name_class, new_size,
-                 patchlib_is_valid(empty) ? &empty : NULL);
-    if (patchlib_is_valid(empty))
+                 empty ? &empty : NULL, allow_create);
+    if (empty)
         patchlib_free(empty);
     if (patchlib_is_valid(f_empty))
         patchlib_free(f_empty);
@@ -1212,7 +1214,7 @@ static void resize_lang_caches(const int base_count, const int new_size) {
     // 物品进背包触发排序时按 type 索引，越界导致物品"消失"）
     patch_handle_t int32_type = patchlib_get_basic_type(PATCH_INT32);
     resize_array("Terraria.UI", "ItemSorting", "_layerIndexForItemType",
-                 int32_type, new_size, NULL);
+                 int32_type, new_size, NULL, allow_create);
     patchlib_free(int32_type);
 
     patchlib_free(tooltip_class);
@@ -1243,10 +1245,10 @@ static void resize_armor_set_bonuses(const int base_count, const int new_size) {
 
     patch_handle_t old_array = PATCH_NULL;
     patchlib_field_get_value(f_sets, NULL, &old_array);
-    if (patchlib_is_valid(old_array)) {
+    if (old_array) {
         if ((size_t) base_count == patchlib_array_length(old_array)) {
             patch_handle_t empty = PATCH_NULL;
-            if (patchlib_array_at(old_array, 0, &empty) && patchlib_is_valid(empty)) {
+            if (patchlib_array_at(old_array, 0, &empty) && empty) {
                 patch_handle_t new_array =
                         patchlib_array_resize(old_array, (size_t) new_size, NULL);
                 if (patchlib_is_valid(new_array)) {
@@ -1645,9 +1647,9 @@ void terraria_item_manager_init_texture2d() {
     patch_handle_t asset_type = terraria_asset_get_generic_class(texture_type);
 
     resize_array("Terraria.GameContent", "TextureAssets", "Item", asset_type,
-                 terraria_item_manager_get_count(), NULL);
+                 terraria_item_manager_get_count(), NULL, true);
     resize_array("Terraria.GameContent", "TextureAssets", "ItemFlame", asset_type,
-                 terraria_item_manager_get_count(), NULL);
+                 terraria_item_manager_get_count(), NULL, true);
 
     patchlib_free(texture_type);
     patchlib_free(asset_type);
@@ -1745,7 +1747,8 @@ void terraria_item_manager_init_texture2d() {
 }
 
 static void resize_array(const char *ns, const char *cls, const char *fid,
-                         patch_handle_t type, const int nsize, void *dvalue) {
+                         patch_handle_t type, const int nsize, void *dvalue,
+                         const bool allow_create) {
     // 获取类型和字段
     patch_handle_t class_handle = patchlib_type_get_type(ns, cls);
     if (!patchlib_is_valid(class_handle)) {
@@ -1764,7 +1767,18 @@ static void resize_array(const char *ns, const char *cls, const char *fid,
     patch_handle_t array = PATCH_NULL;
     patchlib_field_get_value(field, NULL, &array);
 
-    if (!patchlib_is_valid(array)) {
+    if (!array) {
+        if (!allow_create) {
+            /* Main.Initialize 前缀阶段：游戏还没初始化这些缓存，
+             * 这里创建的数组之后会被游戏自己的初始化整个替换掉，
+             * 属于无用功；留到 Initialize_AlmostEverything / Initialize
+             * 的兜底 pass 再做真正的扩容。 */
+            TEKLOG_DEBUG("resize_array: %s.%s.%s not initialized yet, "
+                         "postpone to later pass", ns, cls, fid);
+            patchlib_free(field);
+            patchlib_free(class_handle);
+            return;
+        }
         TEKLOG_WARN(
             "resize_array: Array %s.%s.%s is NULL, creating new array of size %d",
             ns, cls, fid, nsize);
@@ -1954,7 +1968,7 @@ static void resize_quickstacking(const int new_size) {
 
     patch_handle_t scratch = PATCH_NULL;
     patchlib_field_get_value(f_scratch, NULL, &scratch);
-    if (!patchlib_is_valid(scratch)) {
+    if (!scratch) {
         patchlib_free(f_scratch);
         patchlib_free(nested_class);
         patchlib_free(qs_class);
@@ -1966,7 +1980,7 @@ static void resize_quickstacking(const int new_size) {
     if (patchlib_is_valid(f_first)) {
         patch_handle_t array = PATCH_NULL;
         patchlib_field_get_value(f_first, scratch, &array);
-        if (patchlib_is_valid(array)) {
+        if (array) {
             const size_t len = patchlib_array_length(array);
             if (len > 0 && len < (size_t) new_size) {
                 patch_handle_t int_type = patchlib_get_basic_type(PATCH_INT32);
@@ -1995,7 +2009,7 @@ static void resize_quickstacking(const int new_size) {
     patchlib_free(qs_class);
 }
 
-void terraria_item_manager_resize() {
+void terraria_item_manager_resize(const bool allow_create) {
     const int new_size = terraria_item_manager_get_count();
 
     patch_handle_t bool_type = patchlib_get_basic_type(PATCH_BOOL);
@@ -2004,21 +2018,21 @@ void terraria_item_manager_resize() {
     static int d_cached_item_spawns_type = -1;
 
     // 注意：这些数组在 Terraria 中用于存储物品相关的数据
-    resize_array("Terraria", "Item", "claw", bool_type, new_size, NULL);
-    resize_array("Terraria", "Item", "staff", bool_type, new_size, NULL);
-    resize_array("Terraria", "Item", "cachedItemSpawnsByType", int_type, new_size, &d_cached_item_spawns_type);
+    resize_array("Terraria", "Item", "claw", bool_type, new_size, NULL, true);
+    resize_array("Terraria", "Item", "staff", bool_type, new_size, NULL, true);
+    resize_array("Terraria", "Item", "cachedItemSpawnsByType", int_type, new_size, &d_cached_item_spawns_type, true);
 
 #if __ANDROID__
-    resize_array("Terraria", "Player", "ItemUsesRightFire", bool_type, new_size, NULL);
+    resize_array("Terraria", "Player", "ItemUsesRightFire", bool_type, new_size, NULL, true);
     resize_array("", "VirtualControllerInputState", "ItemCategories",
-                 int_type, new_size, NULL);
+                 int_type, new_size, NULL, true);
 #endif
     // 一次性扩容 ItemID.Sets 所有按 ItemID.Count 定长的数组
     resize_all_itemid_sets(terraria_item_id_get_count(), new_size);
     // 绘制物品图标时按 type 索引 Main.itemAnimations，必须同步扩充
-    resize_item_animations(new_size);
+    resize_item_animations(new_size, allow_create);
     // tooltip/名称缓存与物品排序索引同步扩容（无边界检查，越界会导致物品"消失"）
-    resize_lang_caches(terraria_item_id_get_count(), new_size);
+    resize_lang_caches(terraria_item_id_get_count(), new_size, allow_create);
     // 护甲套装查询锯齿数组同步扩容（tooltip 生成路径）
     resize_armor_set_bonuses(terraria_item_id_get_count(), new_size);
     // 兜底：强制扩容运行时物品更新/拾取/绘制会用到的 ItemID.Sets 集合
