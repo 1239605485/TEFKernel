@@ -82,7 +82,7 @@ patch_handle_t terraria_asset_create(patch_handle_t type, patch_handle_t value) 
 
     patch_handle_t asset_ctor = patchlib_type_get_method_by_param_count(asset_generic_class, ".ctor", 1);
     patch_handle_t asset_value = patchlib_type_get_field(asset_generic_class, "<Value>k__BackingField");
-    if (!patchlib_is_valid(asset_value)) {
+    if (!asset_value) {
         asset_value = patchlib_type_get_field(asset_generic_class, "Value");
     }
 

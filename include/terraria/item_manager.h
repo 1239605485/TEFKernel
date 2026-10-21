@@ -89,6 +89,9 @@ typedef struct terraria_item_handle_t {
     bool has_tooltip; //<< 是否存在物品介绍
     int sacrifice_count; //<< 研究所需数量
     int runtime_id;  //<< 由内核分配
+    int anim_ticks;  //<< 帧动画：每帧 tick 数（0 = 不动画）
+    int anim_frames; //<< 帧动画：帧数（竖向帧图）
+    bool anim_registered; //<< 内部：已向游戏注册动画
 
     terraria_item_ops_t item_ops; //<< 内部逻辑
 } terraria_item_handle_t;
@@ -121,6 +124,20 @@ DEFINE_FUNCTION(terraria_item_handle_t*, terraria_item_manager_get_item, int run
  * @warning 不要写或释放该数组
  */
 DEFINE_FUNCTION(tefstd_vector_t*, terraria_item_manager_get_items)
+
+/**
+ * @brief 启动时给所有自定义物品归类"可重铸类别"（哥布林工匠可重铸）
+ * @note 由内核在 Main.Initialize 之后自动调用一次
+ */
+DEFINE_FUNCTION(void, terraria_item_manager_apply_prefix_classes, void)
+
+/**
+ * @brief 声明某个自定义物品可重铸，并指定词缀池
+ * @param item_handle 注册时传给内核的物品句柄
+ * @param prefix_class 0=不可重铸 1=剑/斧/镐 2=长矛 3=枪/弓 4=魔法 5=召唤 6=回旋镖 7=饰品
+ * @note **不声明即不可重铸**（内核不做任何推断，尊重作者意图）
+ */
+DEFINE_FUNCTION(void, terraria_item_manager_set_prefix_class, terraria_item_handle_t* item_handle, int prefix_class)
 
 #ifdef __cplusplus
 }

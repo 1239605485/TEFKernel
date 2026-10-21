@@ -41,7 +41,10 @@ public abstract class Program
     public static void Main(string[] args)
     {
         Console.OutputEncoding = Encoding.UTF8;
-        
+
+        // 交给游戏本身的参数（-world / -autoshutdown / -password ...）
+        var gameArgs = new List<string>();
+
         for (var i = 0; i < args.Length; i++)
         {
             switch (args[i].ToLower())
@@ -76,6 +79,9 @@ public abstract class Program
                 case "-h":
                     ShowHelp();
                     return;
+                default:
+                    gameArgs.Add(args[i]);
+                    break;
             }
         }
 
@@ -137,7 +143,7 @@ public abstract class Program
         Logger.Initialize(TefKernelLib);
         
         // 传递参数到启动函数
-        Launch([]);
+        Launch(gameArgs.ToArray());
     }
 
     private static void ShowHelp()
@@ -412,6 +418,30 @@ public abstract class Program
         Logger.Debug($"Parameter count: {entryPoint.GetParameters().Length}");
         try
         {
+            if (_isServer)
+            {
+                /* Mono 下 HarmonyX/MonoMod 在服务端进程里初始化会抛
+                 * System.TypeLoadException (System.Runtime 4.0.0.0)，
+                 * 导致整个 Launch 中断。服务端不需要 patch SetupLogging，
+                 * 直接在这里初始化内核即可（此时游戏程序集已加载）。 */
+                Logger.Info("Server mode: skipping Harmony patch, initializing kernel directly");
+                try
+                {
+                    // 与 SetupLoggingPrefix 保持一致：先把内核依赖的 C# API 注册进去，
+                    // 否则内核里的函数指针是空的，init 过程中会空指针崩溃。
+                    Initialization.RegisterAllApis();
+                    Logger.Info($"init_ary={_initAry!.Invoke(_workDirs, true)}");
+                }
+                catch (Exception ex)
+                {
+                    Logger.Critical($"init_ary failed: {ex}");
+                }
+
+                entryPoint.Invoke(null, parameters);
+                Logger.Info("Terraria server has exited");
+                return;
+            }
+
             HookManager.Harmony.Patch(targetAssembly.GetType("Terraria.Program").GetMethod("SetupLogging",
                     BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance),
                 postfix: new HarmonyMethod(typeof(Program), nameof(SetupLoggingPrefix)));

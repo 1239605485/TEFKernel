@@ -74,7 +74,7 @@ terraria_item_handle_t *terraria_item_manager_unknown_item();
 void terraria_item_manager_init_texture2d();
 
 // 扩容游戏中的数组以支持物品
-void terraria_item_manager_resize();
+void terraria_item_manager_resize(bool allow_create);
 
 /**
  * @brief 获取原版物品+新物品的数量

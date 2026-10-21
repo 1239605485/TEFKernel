@@ -94,14 +94,17 @@ patch_type_t patchlib_field_get_type(patch_handle_t field) {
             patchlib_free(parent);
             if (parent_name && strcmp(parent_name, "Enum") == 0) {
                 result = PATCH_INT32;
-                patchlib_free(kclass);
+                /* 桌面端 il2cpp_class_from_type 是恒等宏 → kclass 就是入参 type，
+                 * 释放它会让调用者随后再 free 一次（double free → GCHandle 校验崩溃）。
+                 * 只有真正转换出新句柄时才释放。 */
+                if (kclass != type) patchlib_free(kclass);
                 break;
             }
 
 
             const char *class_name = il2cpp_class_get_name(kclass);
             const char *namespace_name = il2cpp_class_get_namespace(kclass);
-            patchlib_free(kclass);
+            if (kclass != type) patchlib_free(kclass);
 
             if (namespace_name && strcmp(namespace_name, "System") == 0) {
                 // System 命名空间下的原始类型
@@ -218,6 +221,7 @@ size_t patchlib_field_get_size(patch_handle_t field) {
             break; // double
         case IL2CPP_TYPE_VALUETYPE:
             result = il2cpp_class_value_size(il2cpp_class_from_il2cpp_type(field_type), NULL);
+            break;
         default:
             result = sizeof(void *);
             break;

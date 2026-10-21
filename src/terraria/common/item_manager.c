@@ -39,6 +39,7 @@
 #include "terraria/asset.h"
 #include "terraria/texture2d.h"
 
+
 tefstd_vector_t g_terraria_item_registry; // 存储 terraria_item_handle_t*
 static bool g_ids_assigned = false;
 
@@ -184,10 +185,13 @@ static terraria_item_handle_t unknown_item = {
     }
 };
 
+
+
 static patch_handle_t f_type = PATCH_NULL;
 static patch_handle_t f_stack = PATCH_NULL;
 static patch_handle_t m_reset_stats = PATCH_NULL;
 static patch_handle_t m_rebuild_tooltip = PATCH_NULL; // void RebuildTooltip()
+static patch_handle_t f_item_animations = PATCH_NULL; // Main.itemAnimations (DrawAnimation[])
 
 static patch_handle_t f_texture_item = PATCH_NULL;
 static patch_handle_t f_texture_item_flame = PATCH_NULL;
@@ -202,6 +206,398 @@ static patch_handle_t m_from_language_key = PATCH_NULL; // static ItemTooltip Fr
 static patch_handle_t f_item_prefix = PATCH_NULL; // Item.prefix (byte)
 static patch_handle_t m_item_net_defaults = PATCH_NULL; // Item.netDefaults(int)
 static patch_handle_t m_item_prefix = PATCH_NULL; // Item.Prefix(int)
+static patch_handle_t m_get_rollable = PATCH_NULL; // Item.GetRollablePrefixes()
+
+/* ------------------------------------------------------------------
+ * 自定义物品的"可重铸类别"
+ *
+ * 哥布林工匠能不能重铸，只看 Item.GetRollablePrefixes()：
+ *   PrefixLegacy.ItemSets.{SwordsHammersAxesPicks, SpearsMacesChainsawsDrillsPunchCannon,
+ *                         GunsBows, Magic, Summon, BoomerangsChakrams,
+ *                         ItemsThatCanHaveLegendary2}[type] == true
+ *   饰品走 IsAPrefixableAccessory() → ItemID.Sets.CanGetPrefixes[type]
+ *
+ * 这几张表我们早就按 ItemID.Count 扩过容（否则会越界），但新槽位是 false，
+ * 于是自定义物品永远"不可重铸"。这里按物品自身属性自动归类并置 true，
+ * Mod 不需要额外声明。
+ * ------------------------------------------------------------------ */
+static patch_handle_t f_pref_swords = PATCH_NULL;
+static patch_handle_t f_pref_spears = PATCH_NULL;
+static patch_handle_t f_pref_guns = PATCH_NULL;
+static patch_handle_t f_pref_magic = PATCH_NULL;
+static patch_handle_t f_pref_summon = PATCH_NULL;
+static patch_handle_t f_pref_boomerang = PATCH_NULL;
+static patch_handle_t f_pref_legendary2 = PATCH_NULL;
+static patch_handle_t f_can_get_prefixes = PATCH_NULL;
+static int g_prefix_sets_state = -1; // -1 未解析 / 0 失败 / 1 就绪
+
+/* Mod 声明的"可重铸类别"。按**句柄**记录（注册后立即声明，不依赖 runtime_id
+ * 何时分配）。0 = 未声明 = 不可重铸（内核不做推断，尊重作者意图）。 */
+#define TEF_PREFIX_DECL_MAX 512
+typedef struct {
+  terraria_item_handle_t *handle;
+  unsigned char cls;
+} tef_prefix_decl_t;
+static tef_prefix_decl_t g_prefix_decls[TEF_PREFIX_DECL_MAX];
+static int g_prefix_decl_count;
+
+static int prefix_decl_lookup(const terraria_item_handle_t *h) {
+  for (int i = 0; i < g_prefix_decl_count; ++i)
+    if (g_prefix_decls[i].handle == h)
+      return (int)g_prefix_decls[i].cls;
+  return 0;
+}
+
+/* 前置声明（定义在下面） */
+static void prefix_set_entry(patch_handle_t field, int type, const char *name);
+
+/* 类别 → 词缀池 */
+static void prefix_set_by_class(const int cls, const int type, const char *name) {
+  switch (cls) {
+    case 1: prefix_set_entry(f_pref_swords, type, "Swords"); break;
+    case 2: prefix_set_entry(f_pref_spears, type, "Spears"); break;
+    case 3: prefix_set_entry(f_pref_guns, type, "GunsBows"); break;
+    case 4: prefix_set_entry(f_pref_magic, type, "Magic"); break;
+    case 5: prefix_set_entry(f_pref_summon, type, "Summon"); break;
+    case 6: prefix_set_entry(f_pref_boomerang, type, "Boomerang"); break;
+    case 7: prefix_set_entry(f_can_get_prefixes, type, "CanGetPrefixes"); break;
+    default: prefix_set_entry(f_pref_swords, type, name); break;
+  }
+}
+
+void terraria_item_manager_set_prefix_class(terraria_item_handle_t *item_handle,
+                                            int prefix_class) {
+  if (!item_handle || prefix_class < 0 || prefix_class > 7)
+    return;
+  for (int i = 0; i < g_prefix_decl_count; ++i) {
+    if (g_prefix_decls[i].handle == item_handle) {
+      g_prefix_decls[i].cls = (unsigned char)prefix_class;
+      return;
+    }
+  }
+  if (g_prefix_decl_count >= TEF_PREFIX_DECL_MAX) {
+    TEKLOG_WARN("prefix: too many declarations (max %d)", TEF_PREFIX_DECL_MAX);
+    return;
+  }
+  g_prefix_decls[g_prefix_decl_count].handle = item_handle;
+  g_prefix_decls[g_prefix_decl_count].cls = (unsigned char)prefix_class;
+  g_prefix_decl_count++;
+}
+
+
+static int resolve_prefix_sets(void) {
+  if (g_prefix_sets_state >= 0)
+    return g_prefix_sets_state;
+  g_prefix_sets_state = 0;
+
+  /* ⚠ 句柄生命周期（桌面 Mono 上踩过崩溃）：
+   * 内核约定是"field 句柄必须在 class 句柄之前释放"，因为桌面端
+   * field 句柄是依附 class 弱句柄的。这里这些 field 句柄要**长期缓存**，
+   * 所以它们所属的 class 句柄绝对不能提前 free ——
+   * 否则之后 field_get_value() 会让 loader 的托管包装去校验已失效的
+   * GCHandle，直接 SIGSEGV 在 mono_gchandle_is_in_domain。
+   * 这些句柄只在启动时取一次，常驻即可（泄漏量可忽略）。 */
+  patch_handle_t pl =
+      patchlib_type_get_type("Terraria.GameContent.Prefixes", "PrefixLegacy");
+  if (!patchlib_is_valid(pl)) {
+    TEKLOG_WARN("prefix: PrefixLegacy not found");
+    return 0;
+  }
+  patch_handle_t sets = patchlib_type_get_inner_type(pl, "ItemSets");
+  if (!patchlib_is_valid(sets)) {
+    TEKLOG_WARN("prefix: PrefixLegacy+ItemSets not found");
+    return 0;
+  }
+  f_pref_swords = patchlib_type_get_field(sets, "SwordsHammersAxesPicks");
+  f_pref_spears =
+      patchlib_type_get_field(sets, "SpearsMacesChainsawsDrillsPunchCannon");
+  f_pref_guns = patchlib_type_get_field(sets, "GunsBows");
+  f_pref_magic = patchlib_type_get_field(sets, "Magic");
+  f_pref_summon = patchlib_type_get_field(sets, "Summon");
+  f_pref_boomerang = patchlib_type_get_field(sets, "BoomerangsChakrams");
+  f_pref_legendary2 =
+      patchlib_type_get_field(sets, "ItemsThatCanHaveLegendary2");
+
+  patch_handle_t itemid = patchlib_type_get_type("Terraria.ID", "ItemID");
+  patch_handle_t idsets = PATCH_NULL;
+  if (patchlib_is_valid(itemid)) {
+    idsets = patchlib_type_get_inner_type(itemid, "Sets");
+    if (patchlib_is_valid(idsets))
+      f_can_get_prefixes = patchlib_type_get_field(idsets, "CanGetPrefixes");
+  }
+
+  if (!patchlib_is_valid(f_pref_swords) ||
+      !patchlib_is_valid(f_can_get_prefixes)) {
+    TEKLOG_WARN("prefix: cannot resolve prefix sets "
+                "(swords=%p canGetPrefixes=%p)",
+                (void *)f_pref_swords, (void *)f_can_get_prefixes);
+    return 0;
+  }
+  g_prefix_sets_state = 1;
+  TEKLOG_INFO("prefix: rollable-prefix sets resolved");
+  return 1;
+}
+
+/* 静态 bool[] 字段的第 type 位置 true（每次现取数组对象：
+ * 扩容会替换数组实例，缓存句柄会失效） */
+static void prefix_set_entry(patch_handle_t field, const int type,
+                             const char *name) {
+  if (!patchlib_is_valid(field) || type < 0)
+    return;
+
+  /* ⚠ 这里拿到的 arr 是**引擎静态字段里的数组句柄**：
+   *  - 桌面(Mono) 下 patch_handle_t 是托管的弱引用 GCHandle，
+   *    释放它会让引擎侧那份引用失效 → 游戏之后读取时
+   *    SIGSEGV 在 mono_gchandle_is_in_domain（fault 0x8c）。
+   *  - Android 下 il2cpp_free 是空实现，所以历史上一直没暴露。
+   * 结论：本函数内 **一律不释放 arr**（即使是扩容前的旧句柄）。 */
+  patch_handle_t arr = PATCH_NULL;
+  patchlib_field_get_value(field, NULL, &arr);
+  if (!patchlib_is_valid(arr)) {
+    /* 静态数组尚未初始化（C# 静态字段在类型首次访问时才创建）。 */
+    static int warned_null = 0;
+    if (warned_null < 4) {
+      warned_null++;
+      TEKLOG_DEBUG("prefix: %s is null (not initialized yet) - will retry", name);
+    }
+    return;
+  }
+
+  size_t len = patchlib_array_length(arr);
+  const int need = terraria_item_id_get_count() +
+                   (int)tefstd_vector_size(&g_terraria_item_registry);
+  if ((int)len < need) {
+    /* 自愈：这些静态数组在扩容时还不存在（或被初始化成原版长度），
+     * 首次用到时按需要补长。新槽位填 0(false)。 */
+    patch_handle_t bigger = patchlib_array_resize(arr, (size_t)need, NULL);
+    if (patchlib_is_valid(bigger)) {
+      patchlib_field_set_value(field, NULL, &bigger);
+      TEKLOG_INFO("prefix: %s grown %zu -> %d (lazy)", name, len, need);
+      arr = bigger;                    /* 旧句柄不释放（引擎可能仍持有） */
+      len = patchlib_array_length(arr);
+    } else {
+      TEKLOG_WARN("prefix: %s grow failed (len=%zu need=%d)", name, len, need);
+      return;
+    }
+  }
+
+  if ((size_t)type >= len) {
+    TEKLOG_WARN("prefix: %s still too short (len=%zu type=%d)", name, len, type);
+    return;
+  }
+
+  unsigned char one = 1;
+  if (!patchlib_array_set(arr, (size_t)type, &one)) {
+    TEKLOG_WARN("prefix: %s set failed (type=%d)", name, type);
+  } else {
+    static unsigned char logged[8192];
+    if (type < (int)sizeof(logged) && !logged[type]) {
+      logged[type] = 1;
+      TEKLOG_INFO("prefix: %s[%d] = true (len=%zu)", name, type, len);
+    }
+  }
+}
+
+
+/* 确保 Main.itemAnimations 句柄可用；返回 false = 无法验证（此时别乱注册） */
+static bool ensure_item_animations_handle(void) {
+    if (patchlib_is_valid(f_item_animations))
+        return true;
+    patch_handle_t main_cls = patchlib_type_get_type("Terraria", "Main");
+    if (!patchlib_is_valid(main_cls))
+        return false;
+    f_item_animations =
+            patchlib_type_get_field(main_cls, "itemAnimations");
+    patchlib_free(main_cls);
+    return patchlib_is_valid(f_item_animations);
+}
+
+/* 保证 Main.itemAnimations 至少 need+1 长（注册自定义 id 前必须先扩容，
+ * 否则 itemAnimations[index] = anim 会 IndexOutOfRangeException） */
+static bool ensure_item_animations_length(int need) {
+    if (!ensure_item_animations_handle())
+        return false;
+    patch_handle_t arr = PATCH_NULL;
+    patchlib_field_get_value(f_item_animations, NULL, &arr);
+    if (!patchlib_is_valid(arr))
+        return false;
+    if ((size_t) need >= patchlib_array_length(arr)) {
+        patch_handle_t bigger =
+                patchlib_array_resize(arr, (size_t) need + 1, NULL);
+        if (!patchlib_is_valid(bigger)) {
+            TEKLOG_ERROR("item anim: itemAnimations grow failed (need=%d)", need);
+            return false;
+        }
+        patchlib_field_set_value(f_item_animations, NULL, &bigger);
+        patchlib_free(bigger);
+        TEKLOG_INFO("item anim: itemAnimations grown to %d", need + 1);
+    }
+    return true;
+}
+
+/* itemAnimations[type] 是否已有动画对象。
+ * 游戏的 InitializeItemAnimations() 会整表清空后只重注册原版动画，
+ * 所以自定义物品的注册不能只做一次，要按现状自愈。 */
+static bool item_animation_registered(int type) {
+    if (!ensure_item_animations_handle())
+        return true; /* 无法验证：当作已注册，避免反复重建 */
+    patch_handle_t arr = PATCH_NULL;
+    patchlib_field_get_value(f_item_animations, NULL, &arr);
+    if (!patchlib_is_valid(arr))
+        return true;
+    bool has = true;
+    if ((size_t) type < patchlib_array_length(arr)) {
+        patch_handle_t v = PATCH_NULL;
+        has = patchlib_array_at(arr, (size_t) type, &v) && patchlib_is_valid(v);
+    }
+    return has;
+}
+
+/* 给物品注册 DrawAnimationVertical 帧动画 */
+static void register_item_animation(terraria_item_handle_t *ih, int type) {
+    if (!ensure_item_animations_length(type))
+        return;
+
+    patch_handle_t anim_cls = patchlib_type_get_type(
+            "Terraria.DataStructures", "DrawAnimationVertical");
+    if (!patchlib_is_valid(anim_cls)) {
+        TEKLOG_WARN("item anim: DrawAnimationVertical not found");
+        return;
+    }
+
+    patch_handle_t ctor =
+            patchlib_type_get_method_by_param_count(anim_cls, ".ctor", 3);
+    if (patchlib_is_valid(ctor)) {
+        const int ticks = ih->anim_ticks > 0 ? ih->anim_ticks : 8;
+        const int frames = ih->anim_frames;
+        unsigned char pingpong = 0;
+        void *ca[3] = {&ticks, &frames, &pingpong};
+        patch_handle_t anim = PATCH_NULL;
+        if (patchlib_constructor_invoke(ctor, &anim, ca) &&
+            patchlib_is_valid(anim)) {
+            patch_handle_t main_cls = patchlib_type_get_type("Terraria", "Main");
+            patch_handle_t reg = patchlib_is_valid(main_cls)
+                    ? patchlib_type_get_method_by_param_count(
+                              main_cls, "RegisterItemAnimation", 2)
+                    : PATCH_NULL;
+            if (patchlib_is_valid(reg)) {
+                void *ra[2] = {&type, &anim};
+                if (patchlib_method_invoke_args(reg, NULL, NULL, ra)) {
+                    ih->anim_registered = true;
+                    TEKLOG_INFO("item anim: %s registered "
+                                "(%d frames / %d ticks, type=%d)",
+                                ih->internal_name ? ih->internal_name : "?",
+                                frames, ticks, type);
+                } else {
+                    TEKLOG_WARN("item anim: %s RegisterItemAnimation 失败",
+                                ih->internal_name ? ih->internal_name : "?");
+                }
+                patchlib_free(reg);
+            }
+            patchlib_free(main_cls);
+            /* 动画对象所有权交给引擎数组；注册失败的对象这里没有根，
+             * Android 下 free 是空操作，桌面由 GC 回收 */
+        }
+        patchlib_free(ctor);
+    }
+    patchlib_free(anim_cls);
+}
+
+/* Main.InitializeItemAnimations postfix：游戏清空动画表后，把自定义物品的
+ * 动画重新注册回去 */
+static void initialize_item_animations_postfix(patch_handle_t this, void **args,
+                                               void *result,
+                                               const patch_method_signature_t *sig_info) {
+    (void) this; (void) args; (void) result; (void) sig_info;
+    const size_t count = tefstd_vector_size(&g_terraria_item_registry);
+    for (size_t i = 0; i < count; ++i) {
+        terraria_item_handle_t **pp =
+                tefstd_vector_at(&g_terraria_item_registry, i);
+        if (!pp || !*pp)
+            continue;
+        terraria_item_handle_t *ih = *pp;
+        if (ih->anim_frames <= 0 || ih->runtime_id < 0)
+            continue;
+        if (!item_animation_registered(ih->runtime_id))
+            register_item_animation(ih, ih->runtime_id);
+    }
+}
+
+/* 每个类型只打一次归类日志（set_defaults 会被频繁调用） */
+static unsigned char g_prefix_logged[8192];
+
+/* 按物品属性决定它能掷出哪一类词缀；对自定义物品幂等（重复调用无害） */
+
+/* 按需归类（唯一的归类入口）：
+ * 游戏在判定重铸/掷前缀时会调用 Item.GetRollablePrefixes()，
+ * 那一刻：
+ *   - 手里是真实 Item 实例（能读到 damage/accessory 等真实属性）
+ *   - PrefixLegacy.ItemSets.* 这个静态类已经被游戏自己访问过 → 数组非 null
+ * 千万不要在 SetDefaults 里做这件事：那时静态数组还是 null，
+ * 桌面(Mono) 上 `field_get_value` 会返回"包着 null 的句柄"，
+ * 随后 array_length() 去读 null 对象 → SIGSEGV（fault 0x8c）。 */
+/* 启动时一次性给自定义物品归类（可重铸类别）。
+ *
+ * 为什么不用钩子：Item.GetRollablePrefixes() 的调用时机（掷前缀，例如挖掉方块
+ * 掉落物品时）正是崩溃高发点，而桌面加载器在钩子编组阶段就会把未清零的返回
+ * 缓冲按 GCHandle 解读 → SIGSEGV(fault 0x8c)。改为这里主动做一次。
+ *
+ * 为什么要先调一次 GetRollablePrefixes：PrefixLegacy 是 C# 静态类，
+ * ItemSets.* 字段在类型首次被访问前是 null；桌面端对 null 字段取出的句柄
+ * 调 array_length 会崩，所以必须先用一次真实调用强制它完成初始化。
+ */
+void terraria_item_manager_apply_prefix_classes(void) {
+  static int applied = 0;
+  if (applied)
+    return;
+  applied = 1;
+
+  const size_t count = tefstd_vector_size(&g_terraria_item_registry);
+  if (count == 0)
+    return;
+  if (g_prefix_decl_count == 0) {
+    TEKLOG_INFO("prefix: no item declared a prefix class, nothing to do");
+    return;
+  }
+  if (resolve_prefix_sets() != 1) {
+    TEKLOG_WARN("prefix: sets unresolved, skip classification");
+    return;
+  }
+
+  /* PrefixLegacy 静态类在首次被访问前 ItemSets.* 是 null（桌面端对 null 字段
+   * 取出的句柄调 array_length 会崩）→ 造一个临时物品主动调一次
+   * GetRollablePrefixes 强制它完成初始化。 */
+  patch_handle_t item_cls = patchlib_type_get_type("Terraria", "Item");
+  if (patchlib_is_valid(item_cls) && patchlib_is_valid(m_get_rollable)) {
+    patch_handle_t ctor =
+        patchlib_type_get_method_by_param_count(item_cls, ".ctor", 2);
+    if (patchlib_is_valid(ctor)) {
+      int any_id = 0;
+      patch_handle_t item = PATCH_NULL, variant = PATCH_NULL;
+      void *ca[2] = { (void *)&any_id, &variant };
+      patchlib_constructor_invoke(ctor, &item, ca);
+      if (patchlib_is_valid(item)) {
+        patch_handle_t ro = PATCH_NULL;
+        patchlib_method_invoke_args(m_get_rollable, item, &ro, NULL);
+        if (patchlib_is_valid(ro)) patchlib_free(ro);
+        patchlib_free(item);
+      }
+    }
+  }
+
+  int done = 0;
+  for (size_t i = 0; i < count; ++i) {
+    terraria_item_handle_t **pp = tefstd_vector_at(&g_terraria_item_registry, i);
+    if (!pp || !*pp) continue;
+    terraria_item_handle_t *h = *pp;
+    if (h->runtime_id < 0) continue;
+    const int cls = prefix_decl_lookup(h);
+    if (cls <= 0) continue;
+    prefix_set_by_class(cls, h->runtime_id, h->internal_name);
+    done++;
+  }
+  TEKLOG_INFO("prefix: %d declared item(s) classified", done);
+}
 
 static void set_defaults_postfix(patch_handle_t this, void **args, void *result,
                                  const patch_method_signature_t *sig_info) {
@@ -239,9 +635,20 @@ static void set_defaults_postfix(patch_handle_t this, void **args, void *result,
         }
     }
 
+    /* 帧动画：物品声明了 anim_frames 就按需注册。
+     * 注意游戏 InitializeItemAnimations() 会把 itemAnimations 整表清空，
+     * 所以这里不能靠一次性标志，而是查现状：槽位为空才注册（自愈）。 */
+    if (item_handle_ptr && *item_handle_ptr) {
+        terraria_item_handle_t *ih = *item_handle_ptr;
+        if (ih->anim_frames > 0 && !item_animation_registered(args_type))
+            register_item_animation(ih, args_type);
+    }
+
     if (patchlib_is_valid(m_rebuild_tooltip))
         patchlib_method_invoke_args(m_rebuild_tooltip, this, PATCH_NULL, NULL);
 }
+
+/* GetRollablePrefixes 钩子：自定义物品按需补归类（数组此时已扩容） */
 
 /*
 static bool
@@ -603,7 +1010,8 @@ static int compare_item(const void *a, const void *b) {
 // 初始化
 
 static void resize_array(const char *ns, const char *cls, const char *fid,
-                         patch_handle_t type, int nsize, void *dvalue);
+                         patch_handle_t type, int nsize, void *dvalue,
+                         const bool allow_create);
 
 #if !__ANDROID__
 // PC端：AssetInitializer.LoadTextures 会按 TextureAssets.Item 的新长度遍历，
@@ -733,6 +1141,9 @@ static void resize_all_class_sets(const char *ns, const char *cls,
     int resized = 0;
     int skipped = 0;
     int error = 0;
+    int skip_excluded = 0, skip_invalid = 0, skip_len = 0;
+    char skip_sample[256];
+    skip_sample[0] = 0;
 
     for (size_t i = 0; i < fields.size; i++) {
         patch_handle_t field = *(patch_handle_t *) tefstd_vector_at(&fields, i);
@@ -758,6 +1169,14 @@ static void resize_all_class_sets(const char *ns, const char *cls,
                          name ? name : "?");
             patchlib_free(field);
             skipped++;
+            skip_excluded++;
+            {
+                size_t used = strlen(skip_sample);
+                if (used < sizeof(skip_sample)) {
+                    snprintf(skip_sample + used, sizeof(skip_sample) - used,
+                             "%s(excl) ", name ? name : "?");
+                }
+            }
             continue;
         }
 
@@ -765,11 +1184,19 @@ static void resize_all_class_sets(const char *ns, const char *cls,
         patch_handle_t array = PATCH_NULL;
         patchlib_field_get_value(field, NULL, &array);
 
-        if (!patchlib_is_valid(array)) {
+        if (!array) {
             TEKLOG_DEBUG("resize_all_itemid_sets: invalid array for %s",
                          name ? name : "?");
             patchlib_free(field);
             skipped++;
+            skip_invalid++;
+            {
+                size_t used = strlen(skip_sample);
+                if (used < sizeof(skip_sample)) {
+                    snprintf(skip_sample + used, sizeof(skip_sample) - used,
+                             "%s(null) ", name ? name : "?");
+                }
+            }
             continue;
         }
 
@@ -781,6 +1208,14 @@ static void resize_all_class_sets(const char *ns, const char *cls,
             patchlib_free(field);
             patchlib_free(array);
             skipped++;
+            skip_len++;
+            {
+                size_t used = strlen(skip_sample);
+                if (used < sizeof(skip_sample)) {
+                    snprintf(skip_sample + used, sizeof(skip_sample) - used,
+                             "%s(len%zu) ", name ? name : "?", len);
+                }
+            }
             continue;
         }
 
@@ -808,9 +1243,12 @@ static void resize_all_class_sets(const char *ns, const char *cls,
 
     tefstd_vector_destroy(&fields);
 
-    TEKLOG_INFO(
-        "resize_all_class_sets: %s.%s %d arrays resized, %d skipped, %d errors",
-        ns, cls, resized, skipped, error);
+    TEKLOG_INFO("resize_all_class_sets: %s.%s resized=%d skipped=%d "
+                "(excluded=%d invalid=%d lenMismatch=%d base=%d) errors=%d",
+                ns, cls, resized, skipped, skip_excluded, skip_invalid,
+                skip_len, base_count, error);
+    if (skipped && skip_sample[0])
+        TEKLOG_DEBUG("  skip sample: %s", skip_sample);
     patchlib_free(sets_class);
 }
 
@@ -830,7 +1268,7 @@ static void resize_all_itemid_sets(const int base_count, const int new_size) {
 // 绘制自定义物品图标（ItemSlot.DrawItemIcon / Main.LoadItem /
 // 更新动画等）时会按 type 索引，必须同步扩容。 新增区域为
 // null，表示自定义物品没有动画帧，符合预期。
-static void resize_item_animations(const int new_size) {
+static void resize_item_animations(const int new_size, const bool allow_create) {
     patch_handle_t draw_animation_class =
             patchlib_type_get_type("Terraria.DataStructures", "DrawAnimation");
     if (!patchlib_is_valid(draw_animation_class)) {
@@ -848,7 +1286,7 @@ static void resize_item_animations(const int new_size) {
     patch_handle_t field = patchlib_type_get_field(main_class, "itemAnimations");
     if (patchlib_is_valid(field)) {
         resize_array("Terraria", "Main", "itemAnimations", draw_animation_class,
-                     new_size, NULL);
+                     new_size, NULL, allow_create);
         patchlib_free(field);
     } else {
         TEKLOG_ERROR(
@@ -863,7 +1301,8 @@ static void resize_item_animations(const int new_size) {
 // GetTooltip 无边界检查，自定义物品悬停取 tooltip 时直接越界。
 // 扩容后 _itemTooltipCache 新槽位填充 ItemTooltip.None，避免返回 null 引发
 // NRE。
-static void resize_lang_caches(const int base_count, const int new_size) {
+static void resize_lang_caches(const int base_count, const int new_size,
+                               const bool allow_create) {
     patch_handle_t tooltip_class =
             patchlib_type_get_type("Terraria.UI", "ItemTooltip");
     patch_handle_t name_class =
@@ -885,9 +1324,9 @@ static void resize_lang_caches(const int base_count, const int new_size) {
     // 新槽位必须填充 ItemTooltip.None，否则 Lang.GetTooltip() 会返回 null，
     // 经 Item.RebuildTooltip() 写入 ToolTip 后在渲染提示时 NRE。
     resize_array("Terraria", "Lang", "_itemTooltipCache", tooltip_class,
-                 new_size, patchlib_is_valid(none) ? &none : NULL);
+                 new_size, none ? &none : NULL, allow_create);
 
-    if (patchlib_is_valid(none))
+    if (none)
         patchlib_free(none);
     if (patchlib_is_valid(f_none))
         patchlib_free(f_none);
@@ -899,8 +1338,8 @@ static void resize_lang_caches(const int base_count, const int new_size) {
     if (patchlib_is_valid(f_empty))
         patchlib_field_get_value(f_empty, NULL, &empty);
     resize_array("Terraria", "Lang", "_itemNameCache", name_class, new_size,
-                 patchlib_is_valid(empty) ? &empty : NULL);
-    if (patchlib_is_valid(empty))
+                 empty ? &empty : NULL, allow_create);
+    if (empty)
         patchlib_free(empty);
     if (patchlib_is_valid(f_empty))
         patchlib_free(f_empty);
@@ -909,7 +1348,7 @@ static void resize_lang_caches(const int base_count, const int new_size) {
     // 物品进背包触发排序时按 type 索引，越界导致物品"消失"）
     patch_handle_t int32_type = patchlib_get_basic_type(PATCH_INT32);
     resize_array("Terraria.UI", "ItemSorting", "_layerIndexForItemType",
-                 int32_type, new_size, NULL);
+                 int32_type, new_size, NULL, allow_create);
     patchlib_free(int32_type);
 
     patchlib_free(tooltip_class);
@@ -940,10 +1379,10 @@ static void resize_armor_set_bonuses(const int base_count, const int new_size) {
 
     patch_handle_t old_array = PATCH_NULL;
     patchlib_field_get_value(f_sets, NULL, &old_array);
-    if (patchlib_is_valid(old_array)) {
+    if (old_array) {
         if ((size_t) base_count == patchlib_array_length(old_array)) {
             patch_handle_t empty = PATCH_NULL;
-            if (patchlib_array_at(old_array, 0, &empty) && patchlib_is_valid(empty)) {
+            if (patchlib_array_at(old_array, 0, &empty) && empty) {
                 patch_handle_t new_array =
                         patchlib_array_resize(old_array, (size_t) new_size, NULL);
                 if (patchlib_is_valid(new_array)) {
@@ -1130,6 +1569,37 @@ void terraria_item_manager_init() {
             patchlib_type_get_method_by_param_count(item_class, "SetDefaults", 2);
 
     patchlib_install_prepost_hook(set_defaults, NULL, set_defaults_postfix);
+
+    /* 游戏会在 Initialize_AlmostEverything 里清空 itemAnimations 整表，
+     * 自定义物品的帧动画要在它之后重新注册 */
+    {
+        patch_handle_t main_cls = patchlib_type_get_type("Terraria", "Main");
+        patch_handle_t init_anims = patchlib_is_valid(main_cls)
+                ? patchlib_type_get_method_by_param_count(main_cls,
+                                                          "InitializeItemAnimations", 0)
+                : PATCH_NULL;
+        if (patchlib_is_valid(init_anims)) {
+            patchlib_install_prepost_hook(init_anims, NULL,
+                                          initialize_item_animations_postfix);
+            TEKLOG_INFO("item anim: hooked Main.InitializeItemAnimations");
+        } else {
+            TEKLOG_WARN("item anim: InitializeItemAnimations not found");
+        }
+        if (patchlib_is_valid(main_cls))
+            patchlib_free(main_cls);
+    }
+
+    /* 只解析句柄，**不挂钩子**：
+     * 这个方法的调用时机（掷前缀，例如挖掉方块掉落物品时）恰好是崩溃高发点，
+     * 而桌面加载器在钩子编组阶段本身就会出问题；改为启动时主动调一次，
+     * 顺便强制 PrefixLegacy 静态类完成初始化。 */
+    m_get_rollable =
+            patchlib_type_get_method_by_param_count(item_class, "GetRollablePrefixes", 0);
+    if (patchlib_is_valid(m_get_rollable)) {
+      TEKLOG_INFO("item_manager: Item.GetRollablePrefixes resolved (no hook)");
+    } else {
+      TEKLOG_WARN("item_manager: Item.GetRollablePrefixes not found");
+    }
 
     patch_handle_t texture_asset_class =
             patchlib_type_get_type("Terraria.GameContent", "TextureAssets");
@@ -1330,9 +1800,9 @@ void terraria_item_manager_init_texture2d() {
     patch_handle_t asset_type = terraria_asset_get_generic_class(texture_type);
 
     resize_array("Terraria.GameContent", "TextureAssets", "Item", asset_type,
-                 terraria_item_manager_get_count(), NULL);
+                 terraria_item_manager_get_count(), NULL, true);
     resize_array("Terraria.GameContent", "TextureAssets", "ItemFlame", asset_type,
-                 terraria_item_manager_get_count(), NULL);
+                 terraria_item_manager_get_count(), NULL, true);
 
     patchlib_free(texture_type);
     patchlib_free(asset_type);
@@ -1430,7 +1900,8 @@ void terraria_item_manager_init_texture2d() {
 }
 
 static void resize_array(const char *ns, const char *cls, const char *fid,
-                         patch_handle_t type, const int nsize, void *dvalue) {
+                         patch_handle_t type, const int nsize, void *dvalue,
+                         const bool allow_create) {
     // 获取类型和字段
     patch_handle_t class_handle = patchlib_type_get_type(ns, cls);
     if (!patchlib_is_valid(class_handle)) {
@@ -1449,7 +1920,18 @@ static void resize_array(const char *ns, const char *cls, const char *fid,
     patch_handle_t array = PATCH_NULL;
     patchlib_field_get_value(field, NULL, &array);
 
-    if (!patchlib_is_valid(array)) {
+    if (!array) {
+        if (!allow_create) {
+            /* Main.Initialize 前缀阶段：游戏还没初始化这些缓存，
+             * 这里创建的数组之后会被游戏自己的初始化整个替换掉，
+             * 属于无用功；留到 Initialize_AlmostEverything / Initialize
+             * 的兜底 pass 再做真正的扩容。 */
+            TEKLOG_DEBUG("resize_array: %s.%s.%s not initialized yet, "
+                         "postpone to later pass", ns, cls, fid);
+            patchlib_free(field);
+            patchlib_free(class_handle);
+            return;
+        }
         TEKLOG_WARN(
             "resize_array: Array %s.%s.%s is NULL, creating new array of size %d",
             ns, cls, fid, nsize);
@@ -1639,7 +2121,7 @@ static void resize_quickstacking(const int new_size) {
 
     patch_handle_t scratch = PATCH_NULL;
     patchlib_field_get_value(f_scratch, NULL, &scratch);
-    if (!patchlib_is_valid(scratch)) {
+    if (!scratch) {
         patchlib_free(f_scratch);
         patchlib_free(nested_class);
         patchlib_free(qs_class);
@@ -1651,7 +2133,7 @@ static void resize_quickstacking(const int new_size) {
     if (patchlib_is_valid(f_first)) {
         patch_handle_t array = PATCH_NULL;
         patchlib_field_get_value(f_first, scratch, &array);
-        if (patchlib_is_valid(array)) {
+        if (array) {
             const size_t len = patchlib_array_length(array);
             if (len > 0 && len < (size_t) new_size) {
                 patch_handle_t int_type = patchlib_get_basic_type(PATCH_INT32);
@@ -1680,7 +2162,7 @@ static void resize_quickstacking(const int new_size) {
     patchlib_free(qs_class);
 }
 
-void terraria_item_manager_resize() {
+void terraria_item_manager_resize(const bool allow_create) {
     const int new_size = terraria_item_manager_get_count();
 
     patch_handle_t bool_type = patchlib_get_basic_type(PATCH_BOOL);
@@ -1689,21 +2171,21 @@ void terraria_item_manager_resize() {
     static int d_cached_item_spawns_type = -1;
 
     // 注意：这些数组在 Terraria 中用于存储物品相关的数据
-    resize_array("Terraria", "Item", "claw", bool_type, new_size, NULL);
-    resize_array("Terraria", "Item", "staff", bool_type, new_size, NULL);
-    resize_array("Terraria", "Item", "cachedItemSpawnsByType", int_type, new_size, &d_cached_item_spawns_type);
+    resize_array("Terraria", "Item", "claw", bool_type, new_size, NULL, true);
+    resize_array("Terraria", "Item", "staff", bool_type, new_size, NULL, true);
+    resize_array("Terraria", "Item", "cachedItemSpawnsByType", int_type, new_size, &d_cached_item_spawns_type, true);
 
 #if __ANDROID__
-    resize_array("Terraria", "Player", "ItemUsesRightFire", bool_type, new_size, NULL);
+    resize_array("Terraria", "Player", "ItemUsesRightFire", bool_type, new_size, NULL, true);
     resize_array("", "VirtualControllerInputState", "ItemCategories",
-                 int_type, new_size, NULL);
+                 int_type, new_size, NULL, true);
 #endif
     // 一次性扩容 ItemID.Sets 所有按 ItemID.Count 定长的数组
     resize_all_itemid_sets(terraria_item_id_get_count(), new_size);
     // 绘制物品图标时按 type 索引 Main.itemAnimations，必须同步扩充
-    resize_item_animations(new_size);
+    resize_item_animations(new_size, allow_create);
     // tooltip/名称缓存与物品排序索引同步扩容（无边界检查，越界会导致物品"消失"）
-    resize_lang_caches(terraria_item_id_get_count(), new_size);
+    resize_lang_caches(terraria_item_id_get_count(), new_size, allow_create);
     // 护甲套装查询锯齿数组同步扩容（tooltip 生成路径）
     resize_armor_set_bonuses(terraria_item_id_get_count(), new_size);
     // 兜底：强制扩容运行时物品更新/拾取/绘制会用到的 ItemID.Sets 集合

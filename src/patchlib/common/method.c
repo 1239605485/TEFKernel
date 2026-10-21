@@ -102,13 +102,16 @@ static patch_type_t il2cpp_type_to_patch_type(patch_handle_t type) {
             patchlib_free(parent);
             if (parent_name && strcmp(parent_name, "Enum") == 0) {
                 result = PATCH_INT32;
-                patchlib_free(kclass);
+                /* 桌面端 il2cpp_class_from_type 是恒等宏 → kclass 就是入参 type，
+                 * 释放它会让调用者随后再 free 一次（double free → GCHandle 校验崩溃）。
+                 * 只有真正转换出新句柄时才释放。 */
+                if (kclass != type) patchlib_free(kclass);
                 break;
             }
 
             const char* class_name = il2cpp_class_get_name(kclass);
             const char* namespace_name = il2cpp_class_get_namespace(kclass);
-            patchlib_free(kclass);
+            if (kclass != type) patchlib_free(kclass);
 
             if (namespace_name && strcmp(namespace_name, "System") == 0) {
                 // System 命名空间下的原始类型
@@ -207,8 +210,17 @@ bool patchlib_method_get_signature(patch_handle_t method, patch_method_signature
      * PATCH_STRUCT 分支会拿它去 il2cpp_class_get_fields()（要 Class*），
      * 喂 Type* 会取不到字段 → ffi_type 变成空结构体 → libffi 调用时
      * **不写返回缓冲** → 结构体返回值（如 Vector2）恒为调用者初始化值 (0,0)。 */
+#if defined(__ANDROID__)
+    /* Android(il2cpp)：patch_type_to_ffi_type 的 PATCH_STRUCT 分支需要 **Class\***，
+     * 传 Type* 会取不到字段 → 结构体返回值写不进调用者缓冲（Vector2 恒 (0,0)）。 */
     signature->return_type_handle =
         il2cpp_class_from_type(il2cpp_method_get_return_type(method));
+#else
+    /* 桌面(Mono)：保持原样。il2cpp_class_from_type 在这里可能返回共享弱句柄，
+     * 而 signature_free 会 free 它 → 会把引擎/loader 持有的句柄作废，
+     * 之后游戏校验 GCHandle 时 SIGSEGV（实测）。 */
+    signature->return_type_handle = il2cpp_method_get_return_type(method);
+#endif
     signature->return_type = patchlib_method_get_return_type(method);
     signature->is_instance = patchlib_method_is_instance(method);
     tefstd_vector_init(&signature->arg_types, sizeof(patch_type_t));

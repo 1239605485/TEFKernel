@@ -48,6 +48,7 @@
 #include "internal/terraria/main.h"
 #include "internal/terraria/texture2d.h"
 #include "internal/terraria/item_manager.h"
+#include "internal/terraria/projectile_manager.h"
 #include "internal/terraria/item_save.h"
 #include "internal/terraria/recipe_manager.h"
 #include "internal/terraria/language_manager.h"
@@ -156,6 +157,7 @@ static int hook_il2cpp_init(const char* domain_name) {
 
     terraria_asset_init();
     terraria_item_manager_init();
+    terraria_projectile_manager_init();
     terraria_item_save_init();
     terraria_recipe_manager_init();
     terraria_language_manager_init();
@@ -228,9 +230,23 @@ static char* read_first_line(const char* filepath) {
 }
 
 // 获取当前应用的数据目录
+/* JNI 铁律：Java 抛出异常后必须先 ExceptionClear 再继续调用 JNI，
+ * 否则 ART 会在下一次 JNI 调用时 AssertNoPendingException → abort(SIGABRT)。
+ * 本文件原先 9 处 JNI 调用、0 处异常检查。 */
+static void tef_jni_clear_pending(JNIEnv *env, const char *where) {
+  if (!env)
+    return;
+  if (env->ExceptionCheck()) {
+    TEKLOG_WARN("jni: 检测到未清理的异常(%s)，已 ExceptionClear", where);
+    env->ExceptionClear();
+  }
+}
+
 static char* get_current_app_data_dir(JavaVM* vm) {
     JNIEnv* env = nullptr;
+
     const jint result = vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6);
+    tef_jni_clear_pending(env, "GetEnv");
 
     if (result == JNI_EDETACHED) {
         vm->AttachCurrentThread(&env, nullptr);
@@ -273,6 +289,7 @@ static char* get_current_app_data_dir(JavaVM* vm) {
     }
 
     jobject application = env->CallObjectMethod(current_activity_thread, get_application_method);
+    tef_jni_clear_pending(env, "getApplication");
     if (!application) {
         TEKLOG_ERROR("Failed to get Application");
         env->DeleteLocalRef(current_activity_thread);
@@ -301,6 +318,7 @@ static char* get_current_app_data_dir(JavaVM* vm) {
     }
 
     jobject files_dir_obj = env->CallObjectMethod(application, get_files_dir_method);
+    tef_jni_clear_pending(env, "getFilesDir");
     if (!files_dir_obj) {
         TEKLOG_ERROR("Failed to get files directory");
         env->DeleteLocalRef(context_class);
@@ -335,6 +353,7 @@ static char* get_current_app_data_dir(JavaVM* vm) {
     }
 
     const auto path_str = reinterpret_cast<jstring>(env->CallObjectMethod(files_dir_obj, get_absolute_path_method));
+    tef_jni_clear_pending(env, "getAbsolutePath");
     const char* path = env->GetStringUTFChars(path_str, nullptr);
 
     // 复制到C字符串

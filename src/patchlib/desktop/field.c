@@ -69,6 +69,12 @@ void patchlib_field_get_value(patch_handle_t field, patch_handle_t instance, voi
         return;
     }
 
+    if (!instance && !patchlib_field_is_static(field)) {
+        const char *fname = patchlib_field_get_name(field);
+        TEKLOG_ERROR("Instance is NULL for non-static field '%s'", fname ? fname : "?");
+        return;
+    }
+
     TEKLOG_DEBUG("Getting field value: field=%p, instance=%p", field, instance);
 
     il2cpp_field_get_value(field, instance, value);
@@ -84,6 +90,12 @@ void patchlib_field_set_value(patch_handle_t field, patch_handle_t instance, voi
 
     if (!value) {
         TEKLOG_ERROR("Value pointer is NULL");
+        return;
+    }
+
+    if (!instance && !patchlib_field_is_static(field)) {
+        const char *fname = patchlib_field_get_name(field);
+        TEKLOG_ERROR("Instance is NULL for non-static field '%s'", fname ? fname : "?");
         return;
     }
 

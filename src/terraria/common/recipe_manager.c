@@ -21,6 +21,8 @@
  *******************************************************************************/
 
 #include "internal/terraria/recipe_manager.h"
+#include "internal/log.h"
+
 #include "patchlib/field.h"
 #include "patchlib/method.h"
 #include "patchlib/property.h"

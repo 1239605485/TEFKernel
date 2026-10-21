@@ -558,10 +558,12 @@ void tefkernel_start(void) {
     TEKLOG_INFO("Starting kernel runtime");
 
     // 1. 初始化所有模块
-    TEKLOG_DEBUG("Initializing all modules");
+    TEKLOG_INFO("start: initializing modules");
     tefkernel_initialize_all_modules();
+    TEKLOG_INFO("start: modules done");
 
     // 2. 初始化所有ModLoader
+    TEKLOG_INFO("start: initializing modloaders (initialized=%d)", (int) g_ml_list_initialized);
     if (g_ml_list_initialized) {
         const size_t ml_count = tefstd_vector_size(&g_ml_list);
         TEKLOG_INFO("Ensuring %zu modloaders are initialized", ml_count);
@@ -579,6 +581,7 @@ void tefkernel_start(void) {
     }
 
     // 3. 初始化所有Mod
+    TEKLOG_INFO("start: initializing mods");
     init_all_mods();
 
     TEKLOG_INFO("Kernel runtime started successfully");
