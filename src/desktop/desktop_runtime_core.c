@@ -78,8 +78,15 @@ API_EXPORT int init_tefkernel(const char *workdir, bool is_server) {
   }
 
   // ============ 构建日志目录路径 ============
+  /* workdir 可能自带或不带结尾斜杠，统一补一个再拼 */
   char log_dir[512];
-  snprintf(log_dir, sizeof(log_dir), "%slogs/tefkernel", workdir);
+  const size_t wlen = strlen(workdir);
+  if (wlen > 0 && workdir[wlen - 1] == '/')
+    snprintf(log_dir, sizeof(log_dir), "%slogs/tefkernel", workdir);
+  else if (wlen > 0 && workdir[wlen - 1] == '\\')
+    snprintf(log_dir, sizeof(log_dir), "%slogs/tefkernel", workdir);
+  else
+    snprintf(log_dir, sizeof(log_dir), "%s/logs/tefkernel", workdir);
 
   // ============ 检查并创建日志目录 ============
   char log_config_filename[512] = {0};

@@ -893,6 +893,197 @@ static bool terraria_netmanager_is_vanilla_connection_packet(const uint8_t *data
     return strncmp(str, terraria_prefix, strlen(terraria_prefix)) == 0;
 }
 
+/* ---------------------------------------------------------------- */
+/* 联机同步辅助（客户端请求 / 服务端权威执行）                        */
+/* ---------------------------------------------------------------- */
+
+static patch_handle_t m_net_send_data11 = PATCH_NULL;
+static patch_handle_t m_net_send_tile_square = PATCH_NULL;
+static patch_handle_t m_net_send_raw = PATCH_NULL;      /* SendPacket / Telepathy.Send */
+static terraria_net_mod_message_cb g_mod_message_cb = NULL;
+static patch_handle_t f_net_mode = PATCH_NULL;          /* Main.netMode */
+
+/* Mod 消息载体消息号。
+ *
+ * 不能用 250 这类“原版未使用”的号：PC ↔ Android 的传输层会在把包交给
+ * MessageBuffer 之前丢掉未知消息号（实测手机端只收到 1~154）。
+ * 这里挂到 RequestWorldData（6）：客户端→服务端、平时只在加入时发一次，
+ * 且负载带 magic，内核在 get_data_hook 里命中才消费，不会影响真正的 6。 */
+#define TEFK_MOD_MESSAGE_ID 6
+
+void terraria_net_set_mod_message_handler(terraria_net_mod_message_cb cb) {
+    g_mod_message_cb = cb;
+}
+
+static int net_mode_now(void) {
+    if (!patchlib_is_valid(f_net_mode)) {
+        patch_handle_t cls = patchlib_type_get_type("Terraria", "Main");
+        if (patchlib_is_valid(cls)) {
+            f_net_mode = patchlib_type_get_field(cls, "netMode");
+            patchlib_free(cls);
+        }
+    }
+    int mode = 0;
+    if (patchlib_is_valid(f_net_mode))
+        patchlib_field_get_value(f_net_mode, PATCH_NULL, &mode);
+    return mode;
+}
+
+/* 把原始字节包发出去（客户端 -> 服务端）。
+ * 桌面：NetMessage.SendPacket(byte[] data, int remoteClient)，服务端用 256；
+ * Android：Telepathy.Client.Send(byte[] data, int length)。 */
+static void net_send_raw_packet(const uint8_t *data, const int len) {
+    if (!data || len <= 0)
+        return;
+    if (!patchlib_is_valid(m_net_send_raw)) {
+        patch_handle_t cls = patchlib_type_get_type("Terraria", "NetMessage");
+        if (patchlib_is_valid(cls)) {
+#if defined(__ANDROID__)
+            patch_handle_t t = patchlib_type_get_type("Telepathy", "Client");
+            if (patchlib_is_valid(t)) {
+                m_net_send_raw = patchlib_type_get_method_by_param_count(t, "Send", 2);
+                patchlib_free(t);
+            }
+#else
+            m_net_send_raw = patchlib_type_get_method_by_param_count(cls, "SendPacket", 2);
+#endif
+            patchlib_free(cls);
+        }
+    }
+    if (!patchlib_is_valid(m_net_send_raw)) {
+        TEKLOG_WARN("net: 原始发送方法未解析（SendPacket/Telepathy.Send），包未发出");
+        return;
+    }
+
+    patch_handle_t uint8_type = patchlib_get_basic_type(PATCH_UINT8);
+    if (!patchlib_is_valid(uint8_type))
+        return;
+    patch_handle_t arr = patchlib_array_create((size_t) len, uint8_type);
+    patchlib_free(uint8_type);
+    if (!patchlib_is_valid(arr))
+        return;
+    patchlib_array_copy_from_c(arr, data, (size_t) len);
+
+#if defined(__ANDROID__)
+    int length = len;
+    void *args[2] = {&arr, &length};
+#else
+    int remote = 256; /* 256 = 发往服务端 */
+    void *args[2] = {&arr, &remote};
+#endif
+    patchlib_method_invoke_args(m_net_send_raw, PATCH_NULL, NULL, args);
+    patchlib_free(arr);
+}
+
+void terraria_net_send_mod_message(const char *mod_id, const char *channel,
+                                   const void *data, int len) {
+    if (!mod_id || !*mod_id || !channel || !*channel)
+        return;
+    if (net_mode_now() != 1) {
+        TEKLOG_WARN("net: mod message 只能在客户端发送 (netMode=%d)", net_mode_now());
+        return;
+    }
+    if (len < 0) len = 0;
+    if (len > 8192) len = 8192;
+
+    const size_t magic_len = strlen(TEFKERNEL_MAGIC_STRING);
+    const size_t mod_len = strlen(mod_id);
+    const size_t ch_len = strlen(channel);
+    const size_t total = 2 + 1 + 1 + magic_len + 2 + mod_len + 2 + ch_len + 4 + (size_t) len;
+
+    uint8_t *buf = malloc(total);
+    if (!buf) return;
+    size_t o = 0;
+    buf[o++] = (uint8_t) (total & 0xFF);
+    buf[o++] = (uint8_t) ((total >> 8) & 0xFF);
+    buf[o++] = TEFK_MOD_MESSAGE_ID;
+    buf[o++] = (uint8_t) magic_len;
+    memcpy(buf + o, TEFKERNEL_MAGIC_STRING, magic_len); o += magic_len;
+    buf[o++] = (uint8_t) (mod_len & 0xFF);
+    buf[o++] = (uint8_t) ((mod_len >> 8) & 0xFF);
+    memcpy(buf + o, mod_id, mod_len); o += mod_len;
+    buf[o++] = (uint8_t) (ch_len & 0xFF);
+    buf[o++] = (uint8_t) ((ch_len >> 8) & 0xFF);
+    memcpy(buf + o, channel, ch_len); o += ch_len;
+    buf[o++] = (uint8_t) (len & 0xFF);
+    buf[o++] = (uint8_t) ((len >> 8) & 0xFF);
+    buf[o++] = (uint8_t) ((len >> 16) & 0xFF);
+    buf[o++] = (uint8_t) ((len >> 24) & 0xFF);
+    if (len > 0) memcpy(buf + o, data, (size_t) len);
+
+    TEKLOG_INFO("net: 发送 mod message mod=%s channel=%s len=%d total=%zu",
+                mod_id, channel, len, total);
+    net_send_raw_packet(buf, (int) total);
+    free(buf);
+}
+
+static void resolve_net_sync_methods(void) {
+    if (patchlib_is_valid(m_net_send_data11) &&
+        patchlib_is_valid(m_net_send_tile_square))
+        return;
+    patch_handle_t cls = patchlib_type_get_type("Terraria", "NetMessage");
+    if (!patchlib_is_valid(cls))
+        return;
+    if (!patchlib_is_valid(m_net_send_data11))
+        m_net_send_data11 =
+                patchlib_type_get_method_by_param_count(cls, "SendData", 11);
+    if (!patchlib_is_valid(m_net_send_tile_square))
+        m_net_send_tile_square =
+                patchlib_type_get_method_by_param_count(cls, "SendTileSquare", 6);
+    patchlib_free(cls);
+}
+
+void terraria_net_send_tile_action(int x, int y, int action) {
+    resolve_net_sync_methods();
+    if (!patchlib_is_valid(m_net_send_data11)) {
+        TEKLOG_WARN("net: SendData(11) 未解析，图格请求未发送");
+        return;
+    }
+    if (x < 0 || y < 0) return;
+
+    /* 原版签名：
+     * SendData(int msgType, int remoteClient, int ignoreClient, NetworkText text,
+     *          int number, float number2, float number3, float number4,
+     *          int number5, int number6, int number7) */
+    int msg = 17, remote = -1, ignore = -1, number = action;
+    patch_handle_t text = PATCH_NULL;
+    float n2 = (float) x, n3 = (float) y, n4 = 0.0f;
+    int n5 = 0, n6 = 0, n7 = 0;
+    void *a[11] = {&msg, &remote, &ignore, &text, &number,
+                   &n2, &n3, &n4, &n5, &n6, &n7};
+    patchlib_method_invoke_args(m_net_send_data11, PATCH_NULL, NULL, a);
+}
+
+void terraria_net_send_tile_square(int x, int y, int width, int height) {
+    /* 直接发 MessageID 20（TileSquare）：
+     *   SendData(20, remoteClient, ignoreClient, text,
+     *            tileX, tileY, xSize, ySize, changeType)
+     * 不走 SendTileSquare 的多重重载（by_param_count 在 IL2CPP 上可能匹配不到，
+     * 失败还是静默的）。SendData(11 参数) 这条路径已被图格请求验证可用。 */
+    resolve_net_sync_methods();
+    if (!patchlib_is_valid(m_net_send_data11)) {
+        TEKLOG_WARN("net: SendData(11) 未解析，TileSquare 未发送");
+        return;
+    }
+    if (width <= 0 || height <= 0) return;
+
+    {
+        static int logged = 0;
+        if (logged < 3) {
+            logged++;
+            TEKLOG_INFO("net: tile_square (%d,%d) %dx%d", x, y, width, height);
+        }
+    }
+
+    int msg = 20, remote = -1, ignore = -1, number = x;
+    patch_handle_t text = PATCH_NULL;
+    float n2 = (float) y, n3 = (float) width, n4 = (float) height;
+    int n5 = 0 /* TileChangeType.None */, n6 = 0, n7 = 0;
+    void *a[11] = {&msg, &remote, &ignore, &text, &number,
+                   &n2, &n3, &n4, &n5, &n6, &n7};
+    patchlib_method_invoke_args(m_net_send_data11, PATCH_NULL, NULL, a);
+}
+
 void terraria_netmanager_init() {
     if (tefkernel_get_module_count() == 0 && tefkernel_get_ml_count() == 0) {
         TEKLOG_INFO("No modules or ModLoaders loaded - version isolation disabled, using vanilla networking logic\n"
@@ -948,6 +1139,50 @@ typedef struct il2cpp_array_t {
 } il2cpp_array_t;
 #endif
 
+/* 解析并分发 Mod 消息；data[start] 是消息号，负载从 start+1 开始。
+ * 返回 true 表示这是内核的 Mod 消息（已被消费，调用方应跳过原版处理）。 */
+static bool handle_mod_message(const uint8_t *data, const int length,
+                               const int start, patch_handle_t instance) {
+    const uint8_t *p = data + start + 1;
+    int remain = length - 1;
+    char mod_id[128] = {0};
+    char channel[128] = {0};
+
+    if (remain < 1) return false;
+    const uint8_t magic_len = *p++; remain -= 1;
+    if (magic_len != strlen(TEFKERNEL_MAGIC_STRING)) return false;
+    if (remain < (int) magic_len + 2 + 2 + 4) return false;
+    if (memcmp(p, TEFKERNEL_MAGIC_STRING, magic_len) != 0) return false;
+    p += magic_len; remain -= magic_len;
+
+    const int mod_len = p[0] | (p[1] << 8); p += 2; remain -= 2;
+    if (mod_len <= 0 || mod_len >= (int) sizeof(mod_id) || remain < mod_len) return true;
+    memcpy(mod_id, p, (size_t) mod_len);
+    mod_id[mod_len] = '\0';
+    p += mod_len; remain -= mod_len;
+
+    const int ch_len = p[0] | (p[1] << 8); p += 2; remain -= 2;
+    if (ch_len <= 0 || ch_len >= (int) sizeof(channel) || remain < ch_len) return true;
+    memcpy(channel, p, (size_t) ch_len);
+    channel[ch_len] = '\0';
+    p += ch_len; remain -= ch_len;
+
+    uint32_t data_len = (uint32_t) p[0] | ((uint32_t) p[1] << 8) |
+                        ((uint32_t) p[2] << 16) | ((uint32_t) p[3] << 24);
+    p += 4; remain -= 4;
+    if (data_len > (uint32_t) remain) data_len = (uint32_t) remain;
+
+    int client = -1;
+    if (patchlib_is_valid(who_am_i))
+        patchlib_field_get_value(who_am_i, instance, &client);
+
+    TEKLOG_INFO("net: mod message mod=%s channel=%s len=%u client=%d",
+                mod_id, channel, data_len, client);
+    if (g_mod_message_cb)
+        g_mod_message_cb(mod_id, channel, p, (int) data_len, client);
+    return true;
+}
+
 static bool get_data_hook(patch_handle_t instance, void **args,
                           const patch_method_signature_t *sig_info, void *result) {
     uint8_t msg_type = 0;
@@ -965,6 +1200,34 @@ static bool get_data_hook(patch_handle_t instance, void **args,
     patchlib_field_get_value(read_buffer_max, NULL, &buffer_max_size);
     patchlib_array_at(read_buffer_array, start, &msg_type);
 #endif
+
+    /* 诊断：每个消息号第一次出现时记一行，确认包是否到达 */
+    {
+        static uint8_t seen_ids[256] = {0};
+        if (!seen_ids[msg_type]) {
+            seen_ids[msg_type] = 1;
+            TEKLOG_INFO("net: first packet msg=%u len=%d", (unsigned) msg_type, length);
+        }
+    }
+
+    /* ---- Mod 消息（服务端权威 RPC）----
+     * 载体是原版已知消息号，必须只在 magic 命中时消费；
+     * 真正的原版同名消息要继续走原版处理。 */
+    if (msg_type == TEFK_MOD_MESSAGE_ID) {
+#if defined(__ANDROID__)
+        if (handle_mod_message(buffer, length, start, instance))
+            return true;
+#else
+        uint8_t *local_buf = malloc((size_t) (buffer_max_size > 0 ? buffer_max_size
+                                                                 : length + 8));
+        if (local_buf) {
+            patchlib_array_copy_to_c(local_buf, read_buffer_array, buffer_max_size);
+            const bool consumed = handle_mod_message(local_buf, length, start, instance);
+            free(local_buf);
+            if (consumed) return true;
+        }
+#endif
+    }
 
     if (msg_type == 1) {
 #if defined(__ANDROID__)

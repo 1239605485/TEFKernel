@@ -801,6 +801,7 @@ tpf_register_symbol(kernel_plugin, #func, (const void *)(func))
 #include "patchlib/type.h"
 #include "patchlib/thread.h"
 #include "patchlib/struct/array.h"
+#include "internal/terraria/netmanager.h"
 #include "patchlib/struct/dictionary.h"
 #include "patchlib/struct/list.h"
 #include "patchlib/struct/string.h"
@@ -1001,6 +1002,11 @@ void tpf_init_libtefkernel() {
     TPF_KERNEL_SYMBOL(patchlib_array_empty);
     TPF_KERNEL_SYMBOL(patchlib_array_length);
     TPF_KERNEL_SYMBOL(patchlib_array_element_size);
+    TPF_KERNEL_SYMBOL(terraria_net_send_tile_action);
+    TPF_KERNEL_SYMBOL(terraria_net_send_tile_square);
+    TPF_KERNEL_SYMBOL(terraria_net_send_mod_message);
+    TPF_KERNEL_SYMBOL(terraria_main_is_server);
+    TPF_KERNEL_SYMBOL(terraria_net_set_mod_message_handler);
 
     // 集合操作API - List
     TPF_KERNEL_SYMBOL(patchlib_list_create);

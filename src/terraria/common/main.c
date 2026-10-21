@@ -161,7 +161,10 @@ static void initialize_almost_everything_postfix(patch_handle_t this, void **arg
     terraria_item_manager_apply_prefix_classes();
 }
 
+static bool g_is_server = false;
+
 void terraria_main_init(const bool is_server) {
+    g_is_server = is_server;
     TEKLOG_DEBUG("terraria_main_init called: is_server=%d", is_server);
 
     patch_handle_t main_class = patchlib_type_get_type("Terraria", "Main");
@@ -279,4 +282,8 @@ patch_handle_t terraria_main_get_local_player() {
     patchlib_method_invoke_args(local_player, NULL, &player, NULL);
     return player;
 #endif
+}
+
+bool terraria_main_is_server(void) {
+    return g_is_server;
 }
