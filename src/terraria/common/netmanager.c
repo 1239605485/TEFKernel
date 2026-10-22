@@ -932,6 +932,46 @@ static int net_mode_now(void) {
     return mode;
 }
 
+#if defined(__ANDROID__)
+/* 取 Android 客机的 Telepathy.Client 实例。
+ *
+ * PE 的 NetMessage.SendData 里客机分支就是这么拿的：
+ *   Netplay.Connection.Client.Send(writeBuffer, length)
+ * 所以优先走这条权威路径；钩子里捕获到的实例作为兜底
+ * （万一调用时机早于 Netplay.Connection 建立）。 */
+static patch_handle_t resolve_telepathy_client(void) {
+    static patch_handle_t f_netplay_connection = PATCH_NULL; /* Netplay.Connection */
+    static patch_handle_t f_connection_client = PATCH_NULL;  /* RemoteConnection.Client */
+
+    if (!patchlib_is_valid(f_netplay_connection)) {
+        patch_handle_t cls = patchlib_type_get_type("Terraria", "Netplay");
+        if (patchlib_is_valid(cls)) {
+            f_netplay_connection = patchlib_type_get_field(cls, "Connection");
+            patchlib_free(cls);
+        }
+    }
+    if (!patchlib_is_valid(f_connection_client)) {
+        patch_handle_t cls = patchlib_type_get_type("Terraria", "RemoteConnection");
+        if (patchlib_is_valid(cls)) {
+            f_connection_client = patchlib_type_get_field(cls, "Client");
+            patchlib_free(cls);
+        }
+    }
+    if (patchlib_is_valid(f_netplay_connection) &&
+        patchlib_is_valid(f_connection_client)) {
+        patch_handle_t conn = PATCH_NULL;
+        patchlib_field_get_value(f_netplay_connection, PATCH_NULL, &conn);
+        if (patchlib_is_valid(conn)) {
+            patch_handle_t client = PATCH_NULL;
+            patchlib_field_get_value(f_connection_client, conn, &client);
+            if (patchlib_is_valid(client))
+                return client;
+        }
+    }
+    return g_telepathy_client;
+}
+#endif
+
 /* 把原始字节包发出去（客户端 -> 服务端）。
  * 桌面：NetMessage.SendPacket(byte[] data, int remoteClient)，服务端用 256；
  * Android：Telepathy.Client.Send(byte[] data, int length)。 */
@@ -968,8 +1008,9 @@ static void net_send_raw_packet(const uint8_t *data, const int len) {
     patchlib_array_copy_from_c(arr, data, (size_t) len);
 
 #if defined(__ANDROID__)
-    if (!patchlib_is_valid(g_telepathy_client)) {
-        TEKLOG_WARN("net: 还没有捕获到 Telepathy.Client 实例，Mod 消息未发送");
+    const patch_handle_t client = resolve_telepathy_client();
+    if (!patchlib_is_valid(client)) {
+        TEKLOG_WARN("net: Netplay.Connection.Client 尚未就绪，Mod 消息未发送");
         patchlib_free(arr);
         return;
     }
@@ -980,7 +1021,7 @@ static void net_send_raw_packet(const uint8_t *data, const int len) {
     void *args[2] = {&arr, &remote};
 #endif
 #if defined(__ANDROID__)
-    patchlib_method_invoke_args(m_net_send_raw, g_telepathy_client, NULL, args);
+    patchlib_method_invoke_args(m_net_send_raw, client, NULL, args);
 #else
     patchlib_method_invoke_args(m_net_send_raw, PATCH_NULL, NULL, args);
 #endif
