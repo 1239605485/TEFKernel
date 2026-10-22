@@ -900,6 +900,9 @@ static bool terraria_netmanager_is_vanilla_connection_packet(const uint8_t *data
 static patch_handle_t m_net_send_data11 = PATCH_NULL;
 static patch_handle_t m_net_send_tile_square = PATCH_NULL;
 static patch_handle_t m_net_send_raw = PATCH_NULL;      /* SendPacket / Telepathy.Send */
+#if defined(__ANDROID__)
+static patch_handle_t g_telepathy_client = PATCH_NULL;  /* Telepathy.Client 实例（Send 是实例方法） */
+#endif
 static terraria_net_mod_message_cb g_mod_message_cb = NULL;
 static patch_handle_t f_net_mode = PATCH_NULL;          /* Main.netMode */
 
@@ -965,13 +968,22 @@ static void net_send_raw_packet(const uint8_t *data, const int len) {
     patchlib_array_copy_from_c(arr, data, (size_t) len);
 
 #if defined(__ANDROID__)
+    if (!patchlib_is_valid(g_telepathy_client)) {
+        TEKLOG_WARN("net: 还没有捕获到 Telepathy.Client 实例，Mod 消息未发送");
+        patchlib_free(arr);
+        return;
+    }
     int length = len;
     void *args[2] = {&arr, &length};
 #else
     int remote = 256; /* 256 = 发往服务端 */
     void *args[2] = {&arr, &remote};
 #endif
+#if defined(__ANDROID__)
+    patchlib_method_invoke_args(m_net_send_raw, g_telepathy_client, NULL, args);
+#else
     patchlib_method_invoke_args(m_net_send_raw, PATCH_NULL, NULL, args);
+#endif
     patchlib_free(arr);
 }
 
@@ -1366,6 +1378,12 @@ static bool send_data_hook(patch_handle_t instance, void **args,
 
 static bool send_hook(patch_handle_t instance, void **args,
                       const patch_method_signature_t *sig_info, void *result) {
+#if defined(__ANDROID__)
+    /* Send 是 Telepathy.Client 的实例方法；这里把实例存下来，
+     * 供内核自己发 Mod 消息时使用（桌面端是静态 SendPacket，不需要）。 */
+    if (!patchlib_is_valid(g_telepathy_client) && patchlib_is_valid(instance))
+        g_telepathy_client = instance;
+#endif
     patch_handle_t array = *(patch_handle_t *) args[0];
     uint8_t pack_id = 0;
     patchlib_array_at(array, 2, &pack_id);
