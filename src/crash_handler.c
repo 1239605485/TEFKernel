@@ -20,6 +20,10 @@
  * Created: 2026/5/30
  *******************************************************************************/
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include "internal/crash_handler.h"
 #include "internal/log.h"
 
@@ -38,6 +42,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <signal.h>
 #include <pthread.h>
 
@@ -52,11 +59,101 @@
 #elif defined(PLATFORM_APPLE) || defined(PLATFORM_LINUX)
     #include <unistd.h>
     #include <execinfo.h>
+    #include <dlfcn.h>
+#endif
+
+#if defined(PLATFORM_ANDROID) || defined(PLATFORM_LINUX) || defined(PLATFORM_APPLE)
+    #include <ucontext.h>
 #endif
 
 #define MAX_BACKTRACE_DEPTH 64
 static volatile sig_atomic_t g_crash_in_progress = 0;
 static pthread_mutex_t g_crash_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+#if defined(PLATFORM_ANDROID) || defined(PLATFORM_LINUX) || defined(PLATFORM_APPLE)
+/* Mono / IL2CPP 会用 SIGSEGV（以及 SIGFPE 等）实现空引用/除零检查，
+ * 并依靠自己的信号处理器把它们转换成可被 C# catch 的异常。
+ *
+ * 我们不能再像以前那样抢占这些信号后直接 exit：那样任何本来会被游戏
+ * catch 掉的 NullReferenceException 都会变成闪退。这里保存原来的
+ * handler，低地址故障（空引用）原样转交回去，运行时照常抛异常。 */
+#define CRASH_MAX_SIGNAL 64
+static struct sigaction g_prev_action[CRASH_MAX_SIGNAL + 1];
+static bool g_prev_saved[CRASH_MAX_SIGNAL + 1];
+static bool g_handler_installed = false;
+
+static void posix_signal_handler(int signal_code, siginfo_t *info, void *context);
+
+static bool crash_forward_to_previous(int sig, siginfo_t *info, void *ctx) {
+    if (sig <= 0 || sig > CRASH_MAX_SIGNAL || !g_prev_saved[sig])
+        return false;
+
+    struct sigaction *prev = &g_prev_action[sig];
+    if (prev->sa_flags & SA_SIGINFO) {
+        if (prev->sa_sigaction == NULL ||
+            prev->sa_sigaction == (void (*)(int, siginfo_t *, void *)) SIG_DFL ||
+            prev->sa_sigaction == (void (*)(int, siginfo_t *, void *)) SIG_IGN)
+            return false;
+        sigaction(sig, prev, NULL); /* 恢复原 handler，避免递归 */
+        prev->sa_sigaction(sig, info, ctx);
+        return true;
+    }
+
+    if (prev->sa_handler == SIG_DFL || prev->sa_handler == SIG_IGN)
+        return false;
+    sigaction(sig, prev, NULL);
+    prev->sa_handler(sig);
+    return true;
+}
+
+static bool crash_install_signal(int sig) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = posix_signal_handler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigfillset(&sa.sa_mask);
+
+    struct sigaction old;
+    if (sigaction(sig, &sa, &old) != 0)
+        return false;
+    if (sig > 0 && sig <= CRASH_MAX_SIGNAL) {
+        g_prev_action[sig] = old;
+        g_prev_saved[sig] = true;
+    }
+    return true;
+}
+#endif
+
+/* ---- 崩溃面包屑 ----
+ * 正常运行时记录最近发生的事件（收发包、物品操作等），崩溃时一起写日志。
+ * 写入路径不加锁：用原子序号占槽，单条 vsnprintf 基本不会被打断。 */
+#define CRUMB_SLOTS 24
+#define CRUMB_LEN   112
+static char g_crumbs[CRUMB_SLOTS][CRUMB_LEN];
+static unsigned g_crumb_seq = 0;
+
+void tefkernel_crumb(const char *fmt, ...) {
+    if (!fmt) return;
+    const unsigned idx = __atomic_fetch_add(&g_crumb_seq, 1u, __ATOMIC_RELAXED)
+                         % CRUMB_SLOTS;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(g_crumbs[idx], CRUMB_LEN, fmt, ap);
+    va_end(ap);
+    g_crumbs[idx][CRUMB_LEN - 1] = '\0';
+}
+
+static void dump_crumbs(void) {
+    const unsigned seq = __atomic_load_n(&g_crumb_seq, __ATOMIC_RELAXED);
+    if (seq == 0) return;
+    TEKLOG_CRITICAL("Recent events (last %u):",
+                    seq < CRUMB_SLOTS ? seq : CRUMB_SLOTS);
+    const unsigned first = seq > CRUMB_SLOTS ? seq - CRUMB_SLOTS : 0;
+    for (unsigned i = first; i < seq; ++i) {
+        const char *s = g_crumbs[i % CRUMB_SLOTS];
+        if (s[0]) TEKLOG_CRITICAL("  [%u] %s", i, s);
+    }
+}
 
 // Android 回溯状态结构体
 #if defined(PLATFORM_ANDROID)
@@ -112,10 +209,19 @@ static void print_backtrace(void) {
 
         for (int i = 0; i < count; i++) {
             Dl_info info;
-            if (dladdr(buffer[i], &info) != 0 && info.dli_sname != NULL) {
-                TEKLOG_CRITICAL("  #%02d: %s (%s+0x%tx)",
-                               i, info.dli_fname, info.dli_sname,
-                               (char*)buffer[i] - (char*)info.dli_saddr);
+            if (dladdr(buffer[i], &info) != 0 && info.dli_fname != NULL) {
+                /* 只要 dladdr 认出了模块，就必须打印「模块+偏移」。
+                 * 以前只在 dli_sname 非空时打印，导致没有导出符号的帧
+                 * （libil2cpp 局部函数、内核 static 函数）退化成裸地址，离线无法符号化。 */
+                const uintptr_t offset = (uintptr_t) buffer[i] - (uintptr_t) info.dli_fbase;
+                if (info.dli_sname != NULL) {
+                    TEKLOG_CRITICAL("  #%02d: %s (%s+0x%tx) [%s+0x%tx]",
+                                   i, info.dli_fname, info.dli_sname,
+                                   (char*)buffer[i] - (char*)info.dli_saddr,
+                                   info.dli_fname, offset);
+                } else {
+                    TEKLOG_CRITICAL("  #%02d: %s+0x%tx", i, info.dli_fname, offset);
+                }
             } else {
                 TEKLOG_CRITICAL("  #%02d: 0x%p", i, buffer[i]);
             }
@@ -192,7 +298,12 @@ static LONG WINAPI windows_exception_handler(EXCEPTION_POINTERS *exception_info)
 #else // POSIX 系统 (Linux/macOS/Android)
 
 static void posix_signal_handler(int signal_code, siginfo_t *info, void *context) {
-    (void)context; // 抑制未使用参数警告
+    /* 运行时自己的空引用/除零检查：低地址故障直接还给原 handler。
+     * 不做日志，避免每次 NullReferenceException 刷屏。 */
+    if (signal_code != SIGABRT && info &&
+        (uintptr_t) info->si_addr < 0x10000 &&
+        crash_forward_to_previous(signal_code, info, context))
+        return;
 
     if (g_crash_in_progress) return;
     g_crash_in_progress = 1;
@@ -215,6 +326,45 @@ static void posix_signal_handler(int signal_code, siginfo_t *info, void *context
     TEKLOG_CRITICAL("Fault address: %p", info->si_addr);
     TEKLOG_CRITICAL("PID: %d", getpid());
 
+#if defined(PLATFORM_ANDROID) || defined(PLATFORM_LINUX)
+    /* 打印故障现场的 PC / SP，backtrace 在信号帧上常常不完整，
+     * 有了 PC 才能知道到底是哪条指令炸的（PC=0 即为空函数指针调用）。 */
+    if (context) {
+        const ucontext_t *uc = (const ucontext_t *) context;
+#if defined(__x86_64__)
+        const void *pc = (const void *) uc->uc_mcontext.gregs[REG_RIP];
+        const void *sp = (const void *) uc->uc_mcontext.gregs[REG_RSP];
+        const void *bp = (const void *) uc->uc_mcontext.gregs[REG_RBP];
+#elif defined(__aarch64__)
+        const void *pc = (const void *) uc->uc_mcontext.pc;
+        const void *sp = (const void *) uc->uc_mcontext.sp;
+        const void *bp = (const void *) uc->uc_mcontext.regs[29];
+#else
+        const void *pc = NULL, *sp = NULL, *bp = NULL;
+#endif
+        TEKLOG_CRITICAL("Fault PC: %p  SP: %p  BP: %p", pc, sp, bp);
+        if (pc) {
+            Dl_info pc_info;
+            if (dladdr(pc, &pc_info) != 0 && pc_info.dli_fname) {
+                const uintptr_t off = (uintptr_t) pc - (uintptr_t) pc_info.dli_fbase;
+                TEKLOG_CRITICAL("Fault PC module: %s+0x%tx", pc_info.dli_fname, off);
+            }
+        }
+    }
+#endif
+
+#if defined(PLATFORM_ANDROID)
+    {
+        Dl_info self_info;
+        if (dladdr((void *) &posix_signal_handler, &self_info) != 0 &&
+            self_info.dli_fbase != NULL) {
+            TEKLOG_CRITICAL("Kernel base: %p (%s)", self_info.dli_fbase,
+                            self_info.dli_fname ? self_info.dli_fname : "?");
+        }
+    }
+#endif
+
+    dump_crumbs();
     print_backtrace();
     TEKLOG_CRITICAL("========================================");
 
@@ -242,47 +392,18 @@ void tefkernel_crash_handler_init(void) {
         SymInitialize(GetCurrentProcess(), NULL, TRUE);
         TEKLOG_INFO("Windows exception handler installed");
 
-    #elif defined(PLATFORM_ANDROID)
-        struct sigaction sa;
-        memset(&sa, 0, sizeof(sa));
-        sa.sa_sigaction = posix_signal_handler;
-        sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
-        sigemptyset(&sa.sa_mask);
-
-        // 阻塞所有信号在信号处理期间
-        sigfillset(&sa.sa_mask);
-
-        sigaction(SIGSEGV, &sa, NULL);
-        sigaction(SIGABRT, &sa, NULL);
-        sigaction(SIGFPE, &sa, NULL);
-        sigaction(SIGILL, &sa, NULL);
-        sigaction(SIGBUS, &sa, NULL);
-        sigaction(SIGTRAP, &sa, NULL);
-
-        TEKLOG_INFO("Android signal handlers installed");
-
-    #else // Linux/macOS
-        struct sigaction sa = {0};
-        sa.sa_sigaction = posix_signal_handler;
-        sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESETHAND;
-        sigemptyset(&sa.sa_mask);
-
-        // 添加额外的安全信号
-        sigaddset(&sa.sa_mask, SIGSEGV);
-        sigaddset(&sa.sa_mask, SIGABRT);
-        sigaddset(&sa.sa_mask, SIGFPE);
-        sigaddset(&sa.sa_mask, SIGILL);
-        sigaddset(&sa.sa_mask, SIGBUS);
-        sigaddset(&sa.sa_mask, SIGTRAP);
-
-        sigaction(SIGSEGV, &sa, NULL);
-        sigaction(SIGABRT, &sa, NULL);
-        sigaction(SIGFPE, &sa, NULL);
-        sigaction(SIGILL, &sa, NULL);
-        sigaction(SIGBUS, &sa, NULL);
-        sigaction(SIGTRAP, &sa, NULL);
-
-        TEKLOG_INFO("POSIX signal handlers installed");
+    #elif defined(PLATFORM_ANDROID) || defined(PLATFORM_LINUX) || defined(PLATFORM_APPLE)
+        /* 保存原 handler 再安装，低地址故障会转交给运行时（见文件顶部） */
+        if (!g_handler_installed) {
+            crash_install_signal(SIGSEGV);
+            crash_install_signal(SIGABRT);
+            crash_install_signal(SIGFPE);
+            crash_install_signal(SIGILL);
+            crash_install_signal(SIGBUS);
+            crash_install_signal(SIGTRAP);
+            g_handler_installed = true;
+        }
+        TEKLOG_INFO("POSIX signal handlers installed (chained)");
     #endif
 
     TEKLOG_INFO("Crash handler initialized successfully");

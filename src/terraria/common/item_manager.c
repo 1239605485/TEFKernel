@@ -29,6 +29,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "internal/crash_handler.h"
 #include "internal/log.h"
 #include "patchlib/field.h"
 #include "patchlib/method.h"
@@ -455,6 +456,9 @@ static bool item_animation_registered(int type) {
 
 /* 给物品注册 DrawAnimationVertical 帧动画 */
 static void register_item_animation(terraria_item_handle_t *ih, int type) {
+    if (ih)
+        tefkernel_crumb("item anim register type=%d frames=%d ticks=%d",
+                        type, ih->anim_frames, ih->anim_ticks);
     if (!ensure_item_animations_length(type))
         return;
 
@@ -617,6 +621,7 @@ static void set_defaults_postfix(patch_handle_t this, void **args, void *result,
     }
 
     TEKLOG_INFO("set_defaults_postfix: custom nid=%d, applying defaults", nid);
+    tefkernel_crumb("item SetDefaults custom id=%d nid=%d", args_type, nid);
 
     // ⭐ 关键：强制恢复 type（SetDefaults 内部可能把它清空了）
     patchlib_field_set_value(f_type, this, args[0]);
@@ -705,6 +710,9 @@ static void get_item_name_postfix(patch_handle_t this, void **args,
     if (nid < 0 || nid >= (int) custom_count) {
         return;
     }
+
+    tefkernel_crumb("item GetItemName custom id=%d nid=%d",
+                    current_item_type, nid);
 
     patch_handle_t array_item_name_cache = PATCH_NULL;
     patchlib_field_get_value(f_item_name_cache, NULL, &array_item_name_cache);
@@ -1787,6 +1795,8 @@ int terraria_item_id_get_count() {
 
 void terraria_item_manager_init_texture2d() {
     TEKLOG_DEBUG("terraria_item_manager_init_texture2d: starting");
+    tefkernel_crumb("item texture init: custom=%zu",
+                    tefstd_vector_size(&g_terraria_item_registry));
 
     // 检查字段是否有效
     if (!patchlib_is_valid(f_texture_item) ||
@@ -1851,6 +1861,8 @@ void terraria_item_manager_init_texture2d() {
         }
 
         terraria_item_handle_t *item_handle = *item_handle_ptr;
+        tefkernel_crumb("item texture set: %s.%s index=%zu",
+                        item_handle->parent_id, item_handle->internal_name, index);
         TEKLOG_DEBUG("init_texture2d: processing item %zu: %s.%s (index=%zu)", i,
                      item_handle->parent_id, item_handle->internal_name, index);
 
