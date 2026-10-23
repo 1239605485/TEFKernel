@@ -189,7 +189,7 @@ public static unsafe class Initialization
         
         
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-        private delegate int DelegateIl2cppClassValueSize(IntPtr typePtr, ref uint? align);
+        private delegate int DelegateIl2cppClassValueSize(IntPtr typePtr, IntPtr align);
         
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate IntPtr DelegateIl2cppObjectGetClass(IntPtr objPtr);

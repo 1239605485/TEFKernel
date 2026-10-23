@@ -82,14 +82,16 @@ public static class Class
         return GCHandle.ToIntPtr(classHandle);
     }
 
-    public static int il2cpp_class_value_size(IntPtr classPtr, ref uint? align)
+    public static int il2cpp_class_value_size(IntPtr classPtr, IntPtr align)
     {
         var classHandle = GCHandle.FromIntPtr(classPtr);
         var type = (Type)classHandle.Target;
 
-        if (align != null) align = (uint)Marshal.SizeOf(type);
-        
-        return Marshal.SizeOf(type);
+        var size = Marshal.SizeOf(type);
+        // C 端签名是 uint32_t* align，可能传入 NULL。
+        if (align != IntPtr.Zero) Marshal.WriteInt32(align, size);
+
+        return size;
     }
 
     // 模拟 il2cpp_class_get_nested_types (C风格数组)
