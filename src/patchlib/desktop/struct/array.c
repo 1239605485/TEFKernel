@@ -46,10 +46,12 @@ bool patchlib_array_at(patch_handle_t array, const size_t index, void *out_value
         return false;
     }
 
-    il2cpp_array_at(array, index, out_value);
-
-    TEKLOG_DEBUG("Array element retrieved successfully");
-    return true;
+    const bool result = il2cpp_array_at(array, index, out_value);
+    if (!result)
+        TEKLOG_ERROR("Failed to get array element at index %zu", index);
+    else
+        TEKLOG_DEBUG("Array element retrieved successfully");
+    return result;
 }
 
 bool patchlib_array_set(patch_handle_t array, const size_t index, void *new_value) {

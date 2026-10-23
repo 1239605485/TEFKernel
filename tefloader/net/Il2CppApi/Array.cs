@@ -52,7 +52,9 @@ public static class Array
         }
     }
 
-    // 模拟 il2cpp_array_element_size - 获取元素大小（保持不变）
+    // 模拟 il2cpp_array_element_size - 获取元素大小
+    // 桌面端调用方可能传入数组对象句柄，也可能按 il2cpp 原生语义传入数组类句柄，
+    // 两种都要支持。
     public static int il2cpp_array_element_size(IntPtr arrayPtr)
     {
         if (arrayPtr == IntPtr.Zero)
@@ -61,10 +63,21 @@ public static class Array
         try
         {
             var arrayHandle = GCHandle.FromIntPtr(arrayPtr);
-            var array = (System.Array)arrayHandle.Target;
+            var target = arrayHandle.Target;
 
-            var elementType = array.GetType().GetElementType();
-            return elementType == null ? 0 : Marshal.SizeOf(elementType);
+            Type? elementType = target switch
+            {
+                System.Array array => array.GetType().GetElementType(),
+                Type type when type.IsArray => type.GetElementType(),
+                Type type => type,
+                _ => null
+            };
+
+            if (elementType == null)
+                return 0;
+
+            // 引用类型数组在 C 侧按 GCHandle 指针存储
+            return elementType.IsValueType ? Marshal.SizeOf(elementType) : IntPtr.Size;
         }
         catch (Exception ex)
         {
