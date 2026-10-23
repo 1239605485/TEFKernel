@@ -112,6 +112,10 @@ API_EXPORT int init_tefkernel(const char *workdir, bool is_server) {
   }
 
   // ============ 继续初始化其他模块 ============
+#if defined(_WIN32)
+  // 必须在任何代码访问 LocalizedText.Empty 之前完成 LanguageManager 的静态初始化。
+  terraria_language_manager_ensure_initialized();
+#endif
   tefkernel_crash_handler_init();
   terraria_main_init(is_server);
   terraria_texture2d_init(is_server);

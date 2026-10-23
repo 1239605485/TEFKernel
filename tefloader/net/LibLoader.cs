@@ -178,7 +178,11 @@ public class LibLoader
     public void LoadLib(string path, bool addExt = false)
     {
         if (ShouldUseWindowsApi)
-            LoadLib(path, WinFlags.LoadAsData | WinFlags.SearchDllDir, addExt);
+            // LOAD_WITH_ALTERED_SEARCH_PATH：以可执行方式加载 DLL，并从 DLL 所在目录
+            // 解析依赖（如 libwinpthread-1.dll）。
+            // 之前使用 LOAD_LIBRARY_AS_DATAFILE (0x2) 会把 DLL 当作数据文件加载，
+            // 虽然 LoadLibrary 成功，但 GetProcAddress("init_tefkernel") 始终返回 0。
+            LoadLib(path, WinFlags.AlterSearch, addExt);
         else
             LoadLib(path, UnixFlags.Now, addExt);
     }

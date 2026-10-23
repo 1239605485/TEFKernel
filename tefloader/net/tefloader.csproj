@@ -46,4 +46,49 @@
         <Using Include="System.Text" />
         <Using Include="System.Threading.Tasks" />
     </ItemGroup>
+
+    <!--
+        Windows 上 tefloader 需要承载 Terraria（32 位）以及 .NET 运行时和内核。
+        不设置 LARGE_ADDRESS_AWARE 时进程只有 2GB 用户地址空间，游戏加载到
+        后期会在 GraphicsDevice.Present 处 OutOfMemoryException。
+        Terraria.exe 本身带有该标志，tefloader 默认没有，这里补上。
+    -->
+    <UsingTask TaskName="SetLargeAddressAware"
+               TaskFactory="RoslynCodeTaskFactory"
+               AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
+        <ParameterGroup>
+            <FilePath ParameterType="System.String" Required="true" />
+        </ParameterGroup>
+        <Task>
+            <Using Namespace="System" />
+            <Using Namespace="System.IO" />
+            <Code Type="Fragment" Language="cs">
+                <![CDATA[
+                var bytes = File.ReadAllBytes(FilePath);
+                if (bytes.Length > 0x40 && bytes[0] == (byte)'M' && bytes[1] == (byte)'Z')
+                {
+                    int pe = BitConverter.ToInt32(bytes, 0x3C);
+                    if (pe > 0 && pe + 0x40 < bytes.Length &&
+                        bytes[pe] == (byte)'P' && bytes[pe + 1] == (byte)'E')
+                    {
+                        int characteristicsOffset = pe + 4 + 18;
+                        ushort characteristics = BitConverter.ToUInt16(bytes, characteristicsOffset);
+                        if ((characteristics & 0x20) == 0)
+                        {
+                            characteristics |= 0x20; // IMAGE_FILE_LARGE_ADDRESS_AWARE
+                            BitConverter.GetBytes(characteristics).CopyTo(bytes, characteristicsOffset);
+                            File.WriteAllBytes(FilePath, bytes);
+                        }
+                    }
+                }
+                ]]>
+            </Code>
+        </Task>
+    </UsingTask>
+
+    <Target Name="MarkLargeAddressAware"
+            AfterTargets="Build"
+            Condition="'$(OS)' == 'Windows_NT' and '$(TargetFrameworkIdentifier)' == '.NETFramework'">
+        <SetLargeAddressAware FilePath="$(TargetPath)" />
+    </Target>
 </Project>

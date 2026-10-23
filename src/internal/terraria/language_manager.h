@@ -31,6 +31,9 @@ extern "C" {
 
 void terraria_language_manager_init();
 
+// Windows 专用：确保 LanguageManager 在 LocalizedText.Empty 之前完成静态初始化
+void terraria_language_manager_ensure_initialized();
+
 #ifdef __cplusplus
 }
 #endif

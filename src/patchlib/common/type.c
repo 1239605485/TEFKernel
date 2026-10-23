@@ -30,6 +30,20 @@
 #include "patchlib/method.h"
 #include "../il2cpp_api.h"
 
+/*
+ * 桌面端 il2cpp_* API 由 C# 加载器实现，返回的数组（assemblies / members）
+ * 来自 Marshal.AllocHGlobal。Windows 上 .NET Framework 的 AllocHGlobal 使用
+ * LocalAlloc，而 MinGW 内核里的 free() 使用另一套 CRT 堆，直接 free 会破坏堆
+ * （0xC0000374 / invalid address specified to RtlFreeHeap）。
+ * 因此 Windows 必须用 LocalFree 释放这类内存；Unix 上 AllocHGlobal 就是 malloc。
+ */
+#if defined(_WIN32)
+#include <windows.h>
+#define TEF_FREE_NATIVE(ptr) LocalFree((HLOCAL)(ptr))
+#else
+#define TEF_FREE_NATIVE(ptr) free(ptr)
+#endif
+
 static bool method_matches_args(
     patch_handle_t method,
     int args_count,
@@ -196,7 +210,7 @@ patch_handle_t patchlib_type_get_type(const char *ns, const char *name) {
         il2cpp_free(image);
         if (found_class) {
 #if !defined(__ANDROID__)
-            free(assemblies);
+            TEF_FREE_NATIVE(assemblies);
 #endif
             TEKLOG_DEBUG("Found type: %s.%s at %p", ns, name, found_class);
             return found_class;
@@ -204,6 +218,9 @@ patch_handle_t patchlib_type_get_type(const char *ns, const char *name) {
     }
 
     TEKLOG_WARN("Type not found: %s.%s", ns, name);
+#if !defined(__ANDROID__)
+    TEF_FREE_NATIVE(assemblies);
+#endif
     return PATCH_NULL;
 }
 
@@ -709,14 +726,14 @@ static bool patchlib_collect_from_type_hierarchy(
                 if (members[i] != NULL) {
                     if (!tefstd_vector_push_back(array, &members[i])) {
                         TEKLOG_ERROR("Failed to add member %d", i);
-                        free(members);
+                        TEF_FREE_NATIVE(members);
                         return false;
                     }
                 }
             }
 
             // 重要：释放 Il2Cpp 返回的数组
-            free(members);
+            TEF_FREE_NATIVE(members);
             members = NULL;
         }
 

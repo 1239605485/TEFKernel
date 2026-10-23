@@ -91,6 +91,30 @@ static void load_language_postfix(patch_handle_t instance, void **args,
 #endif
 }
 
+// LocalizedText.Empty 与 LanguageManager.Instance 存在静态初始化顺序问题：
+// 如果先触碰 LocalizedText.Empty，LanguageManager 的静态构造函数会把尚未
+// 赋值的 LocalizedText.Empty（null）写进 _localizedTexts，随后游戏调用
+// SetAllTextValuesToKeys() 时就会 NRE。这里通过读取静态字段 Instance
+// 强制 LanguageManager 先完成初始化。
+void terraria_language_manager_ensure_initialized() {
+  patch_handle_t language_manager_type =
+      patchlib_type_get_type("Terraria.Localization", "LanguageManager");
+  if (!patchlib_is_valid(language_manager_type))
+    return;
+
+  patch_handle_t instance_field =
+      patchlib_type_get_field(language_manager_type, "Instance");
+  if (patchlib_is_valid(instance_field)) {
+    patch_handle_t instance = PATCH_NULL;
+    patchlib_field_get_value(instance_field, PATCH_NULL, &instance);
+    if (patchlib_is_valid(instance))
+      patchlib_free(instance);
+    patchlib_free(instance_field);
+  }
+
+  patchlib_free(language_manager_type);
+}
+
 void terraria_language_manager_init() {
   tefstd_vector_init(&g_callback,
                      sizeof(terraria_languager_manager_get_localized_text_t));
