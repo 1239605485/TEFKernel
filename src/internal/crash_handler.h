@@ -29,6 +29,13 @@ extern "C" {
 // 初始化崩溃处理器
 void tefkernel_crash_handler_init(void);
 
+// 记录一条崩溃面包屑（正常运行时调用，崩溃时随调用栈一起输出）
+void tefkernel_crumb(const char *fmt, ...)
+#if defined(__GNUC__) || defined(__clang__)
+        __attribute__((format(printf, 1, 2)))
+#endif
+;
+
 #ifdef __cplusplus
 }
 #endif

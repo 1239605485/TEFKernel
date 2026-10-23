@@ -529,3 +529,27 @@ bool patchlib_uninstall_hook(patch_hook_id_t hook_id) {
     TEKLOG_INFO("Hook uninstalled successfully: %d", hook_id);
     return true;
 }
+
+bool patchlib_install_typed_hook(patch_handle_t method, void *detour, void **original) {
+    if (!patchlib_is_valid(method) || !detour || !original) {
+        TEKLOG_ERROR("install_typed_hook: invalid argument (method=%p detour=%p original=%p)",
+                     (void *) method, detour, (void *) original);
+        return false;
+    }
+
+    void *address = patchlib_method_get_pointer(method);
+    if (!address) {
+        TEKLOG_ERROR("install_typed_hook: method pointer is NULL");
+        return false;
+    }
+
+    /* 复用 patchlib 已有的 Dobby 使用点：不再从业务代码直接调 DobbyHook。 */
+    const int rc = DobbyHook(address, (dobby_dummy_func_t) detour,
+                             (dobby_dummy_func_t *) original);
+    if (rc != 0) {
+        TEKLOG_ERROR("install_typed_hook: DobbyHook failed (rc=%d, addr=%p)", rc, address);
+        return false;
+    }
+    TEKLOG_INFO("install_typed_hook: installed at %p (original=%p)", address, *original);
+    return true;
+}

@@ -28,6 +28,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#include "internal/crash_handler.h"
 #include "internal/log.h"
 #include "patchlib/field.h"
 #include "patchlib/method.h"
@@ -60,6 +61,31 @@ static bool send_hook(patch_handle_t instance, void **args,
 
 static bool get_data_hook(patch_handle_t instance, void **args,
                           const patch_method_signature_t *sig_info, void *result);
+
+#if defined(__ANDROID__)
+/* Android 上网络三件套用「强类型直连 hook」而不是 patchlib 的 libffi 泛型 hook。
+ *
+ * 原因：libffi closure / ffi_call 的调用帧没有 unwind 信息。游戏在
+ * ClientLoopFrameUpdate 里对收包逻辑做了 try/catch（异常 → 断开连接），
+ * 一旦 ProcessData 里抛出托管异常（例如 msg 155 的 Main.chest[i] 为空），
+ * 异常展开到 libffi 帧就找不到 handler，直接 std::terminate → SIGABRT。
+ *
+ * 强类型 hook 由普通 C 函数直接调用 Dobby 的 original 指针，展开时只经过
+ * 有 CFI 的 C 帧，异常能正常冒泡到游戏自己的 catch。 */
+static void (*g_orig_process_data)(void *self, void *data, int length, int *message_type);
+static void (*g_orig_send_data)(int msg_type, int remote_client, int ignore_client, void *text,
+                                int number, float n2, float n3, float n4,
+                                int n5, int n6, int n7);
+static bool (*g_orig_client_send)(void *self, void *data, int length);
+
+static void process_data_detour(void *self, void *data, int length, int *message_type);
+static void send_data_detour(int msg_type, int remote_client, int ignore_client, void *text,
+                             int number, float n2, float n3, float n4,
+                             int n5, int n6, int n7);
+static bool client_send_detour(void *self, void *data, int length);
+static void install_typed_net_hooks(patch_handle_t send_data, patch_handle_t send,
+                                    patch_handle_t process_data);
+#endif
 
 /**
  * @brief 获取所有模块、ModLoader和Mod的ID和版本列表
@@ -900,6 +926,9 @@ static bool terraria_netmanager_is_vanilla_connection_packet(const uint8_t *data
 static patch_handle_t m_net_send_data11 = PATCH_NULL;
 static patch_handle_t m_net_send_tile_square = PATCH_NULL;
 static patch_handle_t m_net_send_raw = PATCH_NULL;      /* SendPacket / Telepathy.Send */
+#if defined(__ANDROID__)
+static patch_handle_t g_telepathy_client = PATCH_NULL;  /* Telepathy.Client 实例（Send 是实例方法） */
+#endif
 static terraria_net_mod_message_cb g_mod_message_cb = NULL;
 static patch_handle_t f_net_mode = PATCH_NULL;          /* Main.netMode */
 
@@ -928,6 +957,46 @@ static int net_mode_now(void) {
         patchlib_field_get_value(f_net_mode, PATCH_NULL, &mode);
     return mode;
 }
+
+#if defined(__ANDROID__)
+/* 取 Android 客机的 Telepathy.Client 实例。
+ *
+ * PE 的 NetMessage.SendData 里客机分支就是这么拿的：
+ *   Netplay.Connection.Client.Send(writeBuffer, length)
+ * 所以优先走这条权威路径；钩子里捕获到的实例作为兜底
+ * （万一调用时机早于 Netplay.Connection 建立）。 */
+static patch_handle_t resolve_telepathy_client(void) {
+    static patch_handle_t f_netplay_connection = PATCH_NULL; /* Netplay.Connection */
+    static patch_handle_t f_connection_client = PATCH_NULL;  /* RemoteConnection.Client */
+
+    if (!patchlib_is_valid(f_netplay_connection)) {
+        patch_handle_t cls = patchlib_type_get_type("Terraria", "Netplay");
+        if (patchlib_is_valid(cls)) {
+            f_netplay_connection = patchlib_type_get_field(cls, "Connection");
+            patchlib_free(cls);
+        }
+    }
+    if (!patchlib_is_valid(f_connection_client)) {
+        patch_handle_t cls = patchlib_type_get_type("Terraria", "RemoteConnection");
+        if (patchlib_is_valid(cls)) {
+            f_connection_client = patchlib_type_get_field(cls, "Client");
+            patchlib_free(cls);
+        }
+    }
+    if (patchlib_is_valid(f_netplay_connection) &&
+        patchlib_is_valid(f_connection_client)) {
+        patch_handle_t conn = PATCH_NULL;
+        patchlib_field_get_value(f_netplay_connection, PATCH_NULL, &conn);
+        if (patchlib_is_valid(conn)) {
+            patch_handle_t client = PATCH_NULL;
+            patchlib_field_get_value(f_connection_client, conn, &client);
+            if (patchlib_is_valid(client))
+                return client;
+        }
+    }
+    return g_telepathy_client;
+}
+#endif
 
 /* 把原始字节包发出去（客户端 -> 服务端）。
  * 桌面：NetMessage.SendPacket(byte[] data, int remoteClient)，服务端用 256；
@@ -965,13 +1034,23 @@ static void net_send_raw_packet(const uint8_t *data, const int len) {
     patchlib_array_copy_from_c(arr, data, (size_t) len);
 
 #if defined(__ANDROID__)
+    const patch_handle_t client = resolve_telepathy_client();
+    if (!patchlib_is_valid(client)) {
+        TEKLOG_WARN("net: Netplay.Connection.Client 尚未就绪，Mod 消息未发送");
+        patchlib_free(arr);
+        return;
+    }
     int length = len;
     void *args[2] = {&arr, &length};
 #else
     int remote = 256; /* 256 = 发往服务端 */
     void *args[2] = {&arr, &remote};
 #endif
+#if defined(__ANDROID__)
+    patchlib_method_invoke_args(m_net_send_raw, client, NULL, args);
+#else
     patchlib_method_invoke_args(m_net_send_raw, PATCH_NULL, NULL, args);
+#endif
     patchlib_free(arr);
 }
 
@@ -979,6 +1058,7 @@ void terraria_net_send_mod_message(const char *mod_id, const char *channel,
                                    const void *data, int len) {
     if (!mod_id || !*mod_id || !channel || !*channel)
         return;
+    tefkernel_crumb("mod message %s/%s len=%d", mod_id, channel, len);
     if (net_mode_now() != 1) {
         TEKLOG_WARN("net: mod message 只能在客户端发送 (netMode=%d)", net_mode_now());
         return;
@@ -1034,6 +1114,7 @@ static void resolve_net_sync_methods(void) {
 }
 
 void terraria_net_send_tile_action(int x, int y, int action) {
+    tefkernel_crumb("tile_action (%d,%d) act=%d", x, y, action);
     resolve_net_sync_methods();
     if (!patchlib_is_valid(m_net_send_data11)) {
         TEKLOG_WARN("net: SendData(11) 未解析，图格请求未发送");
@@ -1055,6 +1136,7 @@ void terraria_net_send_tile_action(int x, int y, int action) {
 }
 
 void terraria_net_send_tile_square(int x, int y, int width, int height) {
+    tefkernel_crumb("tile_square (%d,%d) %dx%d", x, y, width, height);
     /* 直接发 MessageID 20（TileSquare）：
      *   SendData(20, remoteClient, ignoreClient, text,
      *            tileX, tileY, xSize, ySize, changeType)
@@ -1114,9 +1196,27 @@ void terraria_netmanager_init() {
     process_data = patchlib_type_get_method(message_buffer_class, "GetData");
 #endif
 
+#if defined(__ANDROID__)
+    /* 强类型 hook 的 ABI 对应 11 参 SendData；by_param_count 拿到的就是它。
+     * 拿不到时退回按名字解析的句柄（仍然比不装 hook 安全）。 */
+    {
+        patch_handle_t send_data11 =
+                patchlib_type_get_method_by_param_count(net_message_class, "SendData", 11);
+        const patch_handle_t target = patchlib_is_valid(send_data11) ? send_data11 : send_data;
+        if (patchlib_is_valid(send_data11)) {
+            TEKLOG_INFO("net: NetMessage.SendData(11) 解析成功，使用强类型 hook");
+        } else {
+            TEKLOG_WARN("net: NetMessage.SendData(11) 未解析，退回默认句柄");
+        }
+        install_typed_net_hooks(target, send, process_data);
+        if (patchlib_is_valid(send_data11))
+            patchlib_free(send_data11);
+    }
+#else
     patchlib_install_prepost_hook(send_data, send_data_hook, NULL);
     patchlib_install_prepost_hook(send, send_hook, NULL);
     patchlib_install_prepost_hook(process_data, get_data_hook, NULL);
+#endif
 
     patchlib_free(message_buffer_class);
     patchlib_free(net_message_class);
@@ -1213,6 +1313,8 @@ static bool get_data_hook(patch_handle_t instance, void **args,
     /* ---- Mod 消息（服务端权威 RPC）----
      * 载体是原版已知消息号，必须只在 magic 命中时消费；
      * 真正的原版同名消息要继续走原版处理。 */
+    tefkernel_crumb("recv msg=%u len=%d", (unsigned) msg_type, length);
+
     if (msg_type == TEFK_MOD_MESSAGE_ID) {
 #if defined(__ANDROID__)
         if (handle_mod_message(buffer, length, start, instance))
@@ -1332,6 +1434,7 @@ static bool send_data_hook(patch_handle_t instance, void **args,
 
     const int msg_type = *(int *) args[0];
     const int remote_client = *(int *) args[1];
+    tefkernel_crumb("SendData msg=%d remote=%d", msg_type, remote_client);
     patch_handle_t error_text = *(patch_handle_t *) args[3];
 
     if (msg_type == 2 && remote_client >= 0 && remote_client < 256) {
@@ -1366,9 +1469,16 @@ static bool send_data_hook(patch_handle_t instance, void **args,
 
 static bool send_hook(patch_handle_t instance, void **args,
                       const patch_method_signature_t *sig_info, void *result) {
+#if defined(__ANDROID__)
+    /* Send 是 Telepathy.Client 的实例方法；这里把实例存下来，
+     * 供内核自己发 Mod 消息时使用（桌面端是静态 SendPacket，不需要）。 */
+    if (!patchlib_is_valid(g_telepathy_client) && patchlib_is_valid(instance))
+        g_telepathy_client = instance;
+#endif
     patch_handle_t array = *(patch_handle_t *) args[0];
     uint8_t pack_id = 0;
     patchlib_array_at(array, 2, &pack_id);
+    tefkernel_crumb("Telepathy.Send msg=%u", (unsigned) pack_id);
 
     if (pack_id == 1) {
         /* 同上：args[0] 是回调参数句柄，不在这里释放。 */
@@ -1380,3 +1490,58 @@ static bool send_hook(patch_handle_t instance, void **args,
     }
     return false;
 }
+
+#if defined(__ANDROID__)
+/* ---- 强类型网络 hook（unwind 安全，见文件上方的说明） ---- */
+
+static void process_data_detour(void *self, void *data, int length, int *message_type) {
+    /* get_data_hook 只读 args[0]（数组）、args[1]（长度）；msg 1 时会把替换后的
+     * 数组/长度写回这两个槽位，所以这里用局部变量即可。 */
+    void *args[2] = {&data, &length};
+    if (get_data_hook((patch_handle_t) self, args, NULL, NULL))
+        return;
+    g_orig_process_data(self, data, length, message_type);
+}
+
+static void send_data_detour(int msg_type, int remote_client, int ignore_client, void *text,
+                             int number, float n2, float n3, float n4,
+                             int n5, int n6, int n7) {
+    void *args[11] = {&msg_type, &remote_client, &ignore_client, &text,
+                      &number, &n2, &n3, &n4, &n5, &n6, &n7};
+    send_data_hook(NULL, args, NULL, NULL);
+    g_orig_send_data(msg_type, remote_client, ignore_client, text, number,
+                     n2, n3, n4, n5, n6, n7);
+}
+
+static bool client_send_detour(void *self, void *data, int length) {
+    void *args[2] = {&data, &length};
+    send_hook((patch_handle_t) self, args, NULL, NULL);
+    return g_orig_client_send(self, data, length);
+}
+
+static void install_typed_hook(const char *label, patch_handle_t method,
+                               void *detour, void **original) {
+    if (!patchlib_is_valid(method)) {
+        TEKLOG_ERROR("net: %s 方法句柄无效，跳过 hook", label);
+        return;
+    }
+    /* 走 patchlib 内部的强类型 hook（同一处 Dobby 使用点），
+     * 业务代码不再直接调用 DobbyHook。 */
+    if (patchlib_install_typed_hook(method, detour, original)) {
+        TEKLOG_INFO("net: %s 强类型 hook 已安装", label);
+    } else {
+        TEKLOG_ERROR("net: %s 强类型 hook 安装失败", label);
+    }
+}
+
+static void install_typed_net_hooks(patch_handle_t send_data,
+                                    patch_handle_t send,
+                                    patch_handle_t process_data) {
+    install_typed_hook("MessageBuffer.ProcessData", process_data,
+                       (void *) process_data_detour, (void **) &g_orig_process_data);
+    install_typed_hook("NetMessage.SendData", send_data,
+                       (void *) send_data_detour, (void **) &g_orig_send_data);
+    install_typed_hook("Telepathy.Client.Send", send,
+                       (void *) client_send_detour, (void **) &g_orig_client_send);
+}
+#endif
