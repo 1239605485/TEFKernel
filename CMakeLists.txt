@@ -89,6 +89,8 @@ set(TERRARIA_SRC
         src/terraria/common/asset.c
         src/terraria/common/item_manager.c
         src/terraria/common/projectile_manager.c
+        src/terraria/common/buff_manager.c
+        src/terraria/common/gui.c
         src/terraria/common/item_save.c
         src/terraria/common/recipe_manager.c
         src/terraria/common/language_manager.c

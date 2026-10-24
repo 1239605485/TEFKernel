@@ -111,6 +111,8 @@ void il2cpp_api_init(void *handle) {
 
     // 加载线程相关API
     LOAD_SYMBOL(il2cpp_thread_current);
+    LOAD_SYMBOL(il2cpp_gchandle_new);
+    LOAD_SYMBOL(il2cpp_gchandle_free);
     LOAD_SYMBOL(il2cpp_thread_attach);
     LOAD_SYMBOL(il2cpp_thread_detach);
 }

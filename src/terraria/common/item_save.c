@@ -26,6 +26,10 @@
  * 所以背包里的 Mod 物品退出重进就没了。这里把自定义物品按稳定字符串键
  * (loader/mod/name) 另存到“伴生文件”，读档后按槽位塞回去；数字 ID 变化也不影响。
  *
+ * 自定义 Buff 也写进玩家伴生文件：原版存档按数字 ID 存 buff，卸载 Mod 后
+ * 残留的 401+ ID 会让 Main.buffNoSave[id] 越界；所以自定义 Buff 一律
+ * Main.buffNoSave = true（原版不存），改由这里按稳定字符串键存读。
+ *
  * 文件位置与命名：
  *   - 玩家：<xxx.plr>.tef  （与玩家存档同目录，随其一起备份/迁移）
  *   - 世界：<xxx.wld>.tef  （覆盖世界内所有箱子 Chest.item）

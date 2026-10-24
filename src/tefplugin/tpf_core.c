@@ -813,6 +813,8 @@ tpf_register_symbol(kernel_plugin, #func, (const void *)(func))
 #include "terraria/language_manager.h"
 #include "terraria/item_manager.h"
 #include "terraria/projectile_manager.h"
+#include "terraria/buff_manager.h"
+#include "terraria/gui.h"
 
 void tpf_init_libtefkernel() {
     TEKLOG_INFO("Initializing libtefkernel - creating TPF instance");
@@ -1100,6 +1102,22 @@ void tpf_init_libtefkernel() {
     TPF_KERNEL_SYMBOL(terraria_projectile_manager_get_projectiles);
     TPF_KERNEL_SYMBOL(terraria_projectile_manager_find_projectile);
     TPF_KERNEL_SYMBOL(terraria_projectile_id_get_count);
+    // buff_manager
+    TPF_KERNEL_SYMBOL(terraria_buff_manager_register_buff);
+    TPF_KERNEL_SYMBOL(terraria_buff_manager_unregister_buff_by_id);
+    TPF_KERNEL_SYMBOL(terraria_buff_manager_get_buff);
+    TPF_KERNEL_SYMBOL(terraria_buff_manager_get_buffs);
+    TPF_KERNEL_SYMBOL(terraria_buff_manager_find_buff);
+    TPF_KERNEL_SYMBOL(terraria_buff_id_get_count);
+    TPF_KERNEL_SYMBOL(terraria_buff_manager_add);
+    TPF_KERNEL_SYMBOL(terraria_buff_manager_time);
+    TPF_KERNEL_SYMBOL(terraria_buff_manager_remove);
+    // gui
+    TPF_KERNEL_SYMBOL(terraria_gui_add_draw);
+    TPF_KERNEL_SYMBOL(terraria_gui_remove_draw);
+    TPF_KERNEL_SYMBOL(terraria_gui_rect);
+    TPF_KERNEL_SYMBOL(terraria_gui_text);
+    TPF_KERNEL_SYMBOL(terraria_gui_image);
 
 
     // 将内核插件添加到全局列表

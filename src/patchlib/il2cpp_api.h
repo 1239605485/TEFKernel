@@ -824,6 +824,19 @@ DEFINE_IL2CPP_API(bool, il2cpp_type_is_byref, const void* type)
  * @brief 获取当前线程
  * @return 线程指针(原始类型: Il2CppThread*)
  */
+/**
+ * @brief 创建一个 GC 句柄（把托管对象钉住，避免被 GC 回收）
+ * @param object 托管对象
+ * @param pinned 是否固定内存地址
+ * @return 句柄，失败返回 NULL
+ */
+DEFINE_IL2CPP_API(void*, il2cpp_gchandle_new, void* object, bool pinned)
+
+/**
+ * @brief 释放 GC 句柄
+ */
+DEFINE_IL2CPP_API(void, il2cpp_gchandle_free, void* handle)
+
 DEFINE_IL2CPP_API(void*, il2cpp_thread_current)
 
 /**
