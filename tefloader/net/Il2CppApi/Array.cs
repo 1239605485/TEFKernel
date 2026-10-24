@@ -20,12 +20,35 @@
 //  * Created: $[InvalidReference]
 //  *******************************************************************************/
 
+using System.Reflection;
 using System.Runtime.InteropServices;
 
 namespace tefloader.Il2CppApi;
 
 public static class Array
 {
+    // 判断值类型是否能直接按内存布局封送。
+    // Nullable<T>、含引用字段的结构体、开放泛型都无法 Marshal.SizeOf/StructureToPtr。
+    private static bool IsBlittable(Type type)
+    {
+        if (!type.IsValueType || type.IsGenericType || type.ContainsGenericParameters)
+            return false;
+
+        if (type.IsPrimitive || type.IsEnum || type.IsPointer ||
+            type == typeof(IntPtr) || type == typeof(UIntPtr))
+            return true;
+
+        // 结构体内只要包含引用字段（如 BannerEffect 里的 LinearCurve），
+        // Marshal.StructureToPtr 就会抛 E_INVALIDARG，必须逐字段判断。
+        foreach (var field in type.GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+        {
+            if (!IsBlittable(field.FieldType))
+                return false;
+        }
+
+        return true;
+    }
+
     // ==================== 基础 API ====================
 
     // 模拟 il2cpp_array_new - 创建新数组（保持不变）
@@ -52,7 +75,9 @@ public static class Array
         }
     }
 
-    // 模拟 il2cpp_array_element_size - 获取元素大小（保持不变）
+    // 模拟 il2cpp_array_element_size - 获取元素大小
+    // 桌面端调用方可能传入数组对象句柄，也可能按 il2cpp 原生语义传入数组类句柄，
+    // 两种都要支持。
     public static int il2cpp_array_element_size(IntPtr arrayPtr)
     {
         if (arrayPtr == IntPtr.Zero)
@@ -61,14 +86,28 @@ public static class Array
         try
         {
             var arrayHandle = GCHandle.FromIntPtr(arrayPtr);
-            var array = (System.Array)arrayHandle.Target;
+            var target = arrayHandle.Target;
 
-            var elementType = array.GetType().GetElementType();
-            return elementType == null ? 0 : Marshal.SizeOf(elementType);
+            Type? elementType = target switch
+            {
+                System.Array array => array.GetType().GetElementType(),
+                Type type when type.IsArray => type.GetElementType(),
+                Type type => type,
+                _ => null
+            };
+
+            if (elementType == null)
+                return 0;
+
+            // 引用类型数组在 C 侧按 GCHandle 指针存储
+            if (!elementType.IsValueType)
+                return IntPtr.Size;
+
+            // Nullable<T> 等无法直接封送的值类型返回 0，调用方会跳过元素复制
+            return IsBlittable(elementType) ? Marshal.SizeOf(elementType) : 0;
         }
-        catch (Exception ex)
+        catch
         {
-            Logger.Error($"Failed to get element size: {ex.Message}");
             return 0;
         }
     }
@@ -268,8 +307,11 @@ public static class Array
             var elementType = array.GetType().GetElementType();
 
             if (elementType!.IsValueType)
-                // 值类型直接复制
             {
+                // Nullable<T> / 含引用字段的结构体无法直接按内存封送
+                if (!IsBlittable(elementType))
+                    return false;
+
                 Marshal.StructureToPtr(value, outValue, false);
             }
             else
@@ -283,7 +325,16 @@ public static class Array
         }
         catch (Exception ex)
         {
-            Logger.Error($"Failed to get array element: {ex.Message}");
+            string arrayType = "?";
+            try
+            {
+                arrayType = (GCHandle.FromIntPtr(arrayPtr).Target as System.Array)?.GetType().FullName ?? "?";
+            }
+            catch
+            {
+                // ignore
+            }
+            Logger.Error($"Failed to get array element (index={index}, array={arrayType}): {ex.Message}");
             return false;
         }
     }
@@ -307,6 +358,10 @@ public static class Array
 
             if (elementType!.IsValueType)
             {
+                // Nullable<T> / 含引用字段的结构体无法直接按内存封送
+                if (!IsBlittable(elementType))
+                    return false;
+
                 // 值类型从指针读取
                 newValue = Marshal.PtrToStructure(value, elementType);
             }
@@ -335,7 +390,16 @@ public static class Array
         }
         catch (Exception ex)
         {
-            Logger.Error($"Failed to set array element: {ex.Message}");
+            string arrayType = "?";
+            try
+            {
+                arrayType = (GCHandle.FromIntPtr(arrayPtr).Target as System.Array)?.GetType().FullName ?? "?";
+            }
+            catch
+            {
+                // ignore
+            }
+            Logger.Error($"Failed to set array element (index={index}, array={arrayType}): {ex.Message}");
             return false;
         }
     }

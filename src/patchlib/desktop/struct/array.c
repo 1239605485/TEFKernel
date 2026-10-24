@@ -46,10 +46,13 @@ bool patchlib_array_at(patch_handle_t array, const size_t index, void *out_value
         return false;
     }
 
-    il2cpp_array_at(array, index, out_value);
-
-    TEKLOG_DEBUG("Array element retrieved successfully");
-    return true;
+    const bool result = il2cpp_array_at(array, index, out_value);
+    if (!result) {
+        // 非 blittable 元素（Nullable<T> / 含引用字段的结构体）无法按值封送，
+        // 这是预期跳过，不是错误，避免每个元素刷一条 ERROR。
+        TEKLOG_DEBUG("Skipped array element at index %zu (unsupported element type)", index);
+    }
+    return result;
 }
 
 bool patchlib_array_set(patch_handle_t array, const size_t index, void *new_value) {

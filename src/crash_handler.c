@@ -245,12 +245,19 @@ static void print_backtrace(void) {
 #if defined(PLATFORM_WINDOWS)
 // Windows 异常处理
 static LONG WINAPI windows_exception_handler(EXCEPTION_POINTERS *exception_info) {
+    DWORD code = exception_info->ExceptionRecord->ExceptionCode;
+
+    /* CLR (.NET) 自身的异常：0xE0434352 = 托管异常，0xE06D7363 = C++ EH。
+     * 这些不是原生崩溃，必须交回 CLR/运行时处理；过去这里直接退出，
+     * 会把本来能被游戏捕获的异常（如线程 Abort、音频初始化失败）当成闪退。 */
+    if (code == 0xE0434352 || code == 0xE06D7363)
+        return EXCEPTION_CONTINUE_SEARCH;
+
     if (g_crash_in_progress) return EXCEPTION_CONTINUE_SEARCH;
     g_crash_in_progress = 1;
 
     pthread_mutex_lock(&g_crash_mutex);
 
-    DWORD code = exception_info->ExceptionRecord->ExceptionCode;
     const char *code_name = "UNKNOWN";
 
     switch (code) {
