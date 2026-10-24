@@ -33,6 +33,8 @@
 #include "internal/terraria/asset.h"
 #include "internal/terraria/item_manager.h"
 #include "internal/terraria/projectile_manager.h"
+#include "internal/terraria/buff_manager.h"
+#include "internal/terraria/gui.h"
 #include "internal/terraria/item_save.h"
 #include "internal/terraria/language_manager.h"
 #include "internal/terraria/main.h"
@@ -122,6 +124,8 @@ API_EXPORT int init_tefkernel(const char *workdir, bool is_server) {
   terraria_asset_init();
   terraria_item_manager_init();
   terraria_projectile_manager_init();
+  terraria_buff_manager_init();
+  terraria_gui_init();
   terraria_item_save_init();
   terraria_recipe_manager_init();
   terraria_language_manager_init();
