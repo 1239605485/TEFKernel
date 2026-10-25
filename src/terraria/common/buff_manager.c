@@ -499,14 +499,6 @@ static void *main_sprite_batch(void) {
 
 /* 内核自绘提示：不碰游戏的 MouseText（桌面端会崩），样式照原版：
  * 深色底 + 细边框，第一行名字，第二行说明，跟随指针。 */
-static int text_cells(const char *s) {
-    int n = 0;
-    if (!s) return 0;
-    for (const unsigned char *p = (const unsigned char *) s; *p; ++p)
-        if ((*p & 0xC0) != 0x80) n++;   /* 统计 UTF-8 码点数（CJK 也算 1 格） */
-    return n;
-}
-
 #if defined(__ANDROID__)
 /* PE：直接调游戏 Main.MouseText —— 面板、字体、材质包全部原生。
  * 文本句柄常驻（内核自有文本 + gchandle 钉住），不会再悬空。 */
@@ -863,12 +855,6 @@ static bool buff_item_draw_prefix(patch_handle_t this, void **args,
     else
         terraria_gui_rect(pos[0], pos[1], size, size, 0xFF00FF00u);
 
-    static int dbg;
-    if (dbg < 3) {
-        dbg++;
-        TEKLOG_INFO("buff bar: override index=%d pos=(%.1f,%.1f) scale=%.2f size=%.1f tint=%08x",
-                    index, pos[0], pos[1], item_scale, size, tint);
-    }
 
     if (!h->no_time_display) {
         /* 与原版 GUIBuffs.ItemDraw 一致：<60s 用秒，<60min 用分，再往上用小时，
@@ -882,18 +868,6 @@ static bool buff_item_draw_prefix(patch_handle_t this, void **args,
             snprintf(label, sizeof(label), "%d m", (a->time + 1800) / 3600);
         } else {
             snprintf(label, sizeof(label), "%d h", (a->time + 108000) / 216000);
-        }
-        {
-            static unsigned last_log;
-            static int last_frames = -1;
-            if ((unsigned) (a->time / 60) != last_log) {
-                last_log = (unsigned) (a->time / 60);
-                if (a->time != last_frames) {
-                    last_frames = a->time;
-                    TEKLOG_INFO("buff bar: time id=%d frames=%d sec=%d",
-                                a->buff_id, a->time, (a->time + 59) / 60);
-                }
-            }
         }
         /* 原版：位置 = 图标位置 + TextOffset * ItemScale，
          *       字号 = ItemScale * TextScale，
@@ -1015,14 +989,6 @@ static void pc_buffs_draw_postfix(patch_handle_t this, void **args, void *result
             const int dx = g_pc_icon_x - g_pc_icon_prev_x;
             const int dy = g_pc_icon_y - g_pc_icon_prev_y;
             if (dx > 0 && dy == 0) step = dx;
-        }
-    }
-    {
-        static int logged;
-        if (logged < 3) {
-            logged++;
-            TEKLOG_INFO("pc buff bar: vanilla=%d recorded=%d base=(%d,%d) step=%d",
-                        n, g_pc_icon_count, base_x, base_y, step);
         }
     }
 
