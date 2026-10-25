@@ -20,6 +20,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "patchlib/il2cpp_api.h"
+#include "patchlib/struct/string.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -44,13 +45,32 @@ static patch_hook_id_t h_player_update = PATCH_HOOK_INVALID_ID;
 static patch_hook_id_t h_buff_bar = PATCH_HOOK_INVALID_ID;
 static patch_handle_t f_sprite_batch = PATCH_NULL;
 static patch_handle_t f_main_my_player = PATCH_NULL;  /* PC 是 Main.myPlayer 字段 */
+static patch_handle_t f_main_mouse_x = PATCH_NULL;
+static patch_handle_t f_main_mouse_y = PATCH_NULL;
 static patch_handle_t f_player_who_am_i = PATCH_NULL; /* Player.whoAmI */
 /* 原版 Buff 栏布局：Buffs_Layout.ItemScale / NormalColour */
 static patch_handle_t m_layout_instance = PATCH_NULL;
 static patch_handle_t f_layout_item_scale = PATCH_NULL;
+static patch_handle_t f_layout_selected_scale = PATCH_NULL;
 static patch_handle_t f_layout_normal_colour = PATCH_NULL;
 static patch_handle_t f_layout_text_scale = PATCH_NULL;
 static patch_handle_t f_layout_text_offset = PATCH_NULL;
+static patch_handle_t g_font = PATCH_NULL;   /* FontAssets.ItemStack.Value */
+/* 鼠标/触摸：PC 是字段，手机是属性（getter） */
+static patch_handle_t m_get_mouse_x = PATCH_NULL;
+static patch_handle_t m_get_mouse_y = PATCH_NULL;
+static patch_handle_t m_get_mouse_left = PATCH_NULL;
+static patch_handle_t m_get_mouse_right = PATCH_NULL;
+static patch_handle_t f_main_mouse_left = PATCH_NULL;
+static patch_handle_t f_main_mouse_right = PATCH_NULL;
+static int g_mx = -1, g_my = -1;
+static bool g_left_down, g_right_down;
+static bool g_left_tap, g_right_tap;
+/* 每帧每个自定义 Buff 的悬停强度（0.4 ~ 1.0），复刻 Main.buffAlpha */
+static float g_buff_alpha[32];
+static int g_last_tap_buff = -1;      /* 双击取消：上一次点到的 Buff */
+static unsigned g_last_tap_frame;     /* 用绘制帧号近似 */
+static unsigned g_frame_no;
 static bool g_ids_assigned = false;
 static int g_base_count = -1;
 
@@ -90,10 +110,31 @@ static int compare_buff(const void *a, const void *b) {
     return strcmp(pa->internal_name, pb->internal_name);
 }
 
+static char *dup_cstr(const char *s) {
+    if (!s || !*s) return NULL;
+    const size_t n = strlen(s) + 1;
+    char *p = malloc(n);
+    if (p) memcpy(p, s, n);
+    return p;
+}
+
+/* 注册时把展示文本拷进内核（此时 Lua 的 entry 一定还活着） */
+static void capture_display_text(terraria_buff_handle_t *h) {
+    if (!h) return;
+    const char *name = h->buff_ops.get_display_name ? h->buff_ops.get_display_name(h) : NULL;
+    const char *desc = h->buff_ops.get_display_description
+                               ? h->buff_ops.get_display_description(h) : NULL;
+    /* 注册时句柄是全新的（LuaLoader 刚构造），不能 free 未初始化指针 */
+    h->display_name = dup_cstr(name ? name : h->internal_name);
+    h->display_description = dup_cstr(desc);
+}
+
 bool terraria_buff_manager_register_buff(terraria_buff_handle_t *buff_handle) {
     if (!buff_handle || !buff_handle->parent_modloader_id ||
         !buff_handle->parent_id || !buff_handle->internal_name)
         return false;
+
+    capture_display_text(buff_handle);
 
     const size_t count = tefstd_vector_size(&g_terraria_buff_registry);
     for (size_t i = 0; i < count; ++i) {
@@ -132,6 +173,10 @@ static void clear_active_of(const int runtime_id) {
             i++;
         }
     }
+}
+
+void terraria_buff_manager_refresh_display_text(terraria_buff_handle_t *h) {
+    capture_display_text(h);
 }
 
 bool terraria_buff_manager_unregister_buff_by_id(const int runtime_id) {
@@ -246,6 +291,18 @@ int terraria_buff_manager_add(terraria_buff_handle_t *h, patch_handle_t player, 
     if (time > a->time) a->time = time;
     if (h->buff_ops.apply) h->buff_ops.apply(h, player, a->time);
     return a->time;
+}
+
+void terraria_buff_manager_visit_active(patch_handle_t player,
+                                        terraria_buff_active_visitor_t visitor,
+                                        void *user) {
+    if (!visitor || player == PATCH_NULL) return;
+    const int who = player_who(player);
+    for (int i = 0; i < g_active_count; ++i) {
+        if (g_active[i].who != who || g_active[i].time <= 0) continue;
+        terraria_buff_handle_t *h = find_by_runtime_id(g_active[i].buff_id);
+        if (h) visitor(user, h, g_active[i].time);
+    }
 }
 
 int terraria_buff_manager_time(terraria_buff_handle_t *h, patch_handle_t player) {
@@ -369,6 +426,54 @@ static int main_my_player(void) {
     return -1;
 }
 
+static bool read_int_handle(patch_handle_t field, patch_handle_t getter, int *out) {
+    if (!out) return false;
+    unsigned char buf[64];
+    memset(buf, 0, sizeof(buf));
+    if (getter != PATCH_NULL) {
+        patchlib_method_invoke_args(getter, NULL, buf, NULL);
+    } else if (field != PATCH_NULL) {
+        patchlib_field_get_value(field, NULL, buf);
+    } else {
+        return false;
+    }
+    memcpy(out, buf, sizeof(int));
+    return true;
+}
+
+static bool read_mouse_x(int *x) { return read_int_handle(f_main_mouse_x, m_get_mouse_x, x); }
+static bool read_mouse_y(int *y) { return read_int_handle(f_main_mouse_y, m_get_mouse_y, y); }
+
+static bool read_bool_handle(patch_handle_t field, patch_handle_t getter, bool *out) {
+    if (!out) return false;
+    unsigned char buf[64];
+    memset(buf, 0, sizeof(buf));
+    if (getter != PATCH_NULL) {
+        patchlib_method_invoke_args(getter, NULL, buf, NULL);
+    } else if (field != PATCH_NULL) {
+        patchlib_field_get_value(field, NULL, buf);
+    } else {
+        return false;
+    }
+    *out = buf[0] != 0;
+    return true;
+}
+
+static void update_mouse_state(void) {
+    int x = -1, y = -1;
+    if (read_mouse_x(&x) && read_mouse_y(&y)) {
+        g_mx = x;
+        g_my = y;
+    }
+    bool left = false, right = false;
+    read_bool_handle(f_main_mouse_left, m_get_mouse_left, &left);
+    read_bool_handle(f_main_mouse_right, m_get_mouse_right, &right);
+    g_left_tap = left && !g_left_down;
+    g_right_tap = right && !g_right_down;
+    g_left_down = left;
+    g_right_down = right;
+}
+
 static patch_handle_t local_player_obj(void) {
     if (f_main_player == PATCH_NULL) return PATCH_NULL;
     const int my = main_my_player();
@@ -392,6 +497,81 @@ static void *main_sprite_batch(void) {
     return sb;
 }
 
+/* 内核自绘提示：不碰游戏的 MouseText（桌面端会崩），样式照原版：
+ * 深色底 + 细边框，第一行名字，第二行说明，跟随指针。 */
+static int text_cells(const char *s) {
+    int n = 0;
+    if (!s) return 0;
+    for (const unsigned char *p = (const unsigned char *) s; *p; ++p)
+        if ((*p & 0xC0) != 0x80) n++;   /* 统计 UTF-8 码点数（CJK 也算 1 格） */
+    return n;
+}
+
+#if defined(__ANDROID__)
+/* PE：直接调游戏 Main.MouseText —— 面板、字体、材质包全部原生。
+ * 文本句柄常驻（内核自有文本 + gchandle 钉住），不会再悬空。 */
+static patch_handle_t f_main_inst = PATCH_NULL;
+static patch_handle_t m_pe_mouse_text = PATCH_NULL;
+static patch_handle_t g_pe_sn = PATCH_NULL, g_pe_sd = PATCH_NULL;
+static void *g_pe_pn = NULL, *g_pe_pd = NULL;
+static int g_pe_id = -1;
+
+static void show_tooltip_native(terraria_buff_handle_t *h) {
+    if (!h || m_pe_mouse_text == PATCH_NULL) return;
+    const char *name = h->display_name ? h->display_name : h->internal_name;
+    const char *desc = h->display_description;
+    if (!name || !*name) return;
+    if (g_pe_id != h->runtime_id) {
+        if (g_pe_pn && il2cpp_gchandle_free) il2cpp_gchandle_free(g_pe_pn);
+        if (g_pe_pd && il2cpp_gchandle_free) il2cpp_gchandle_free(g_pe_pd);
+        g_pe_pn = g_pe_pd = NULL;
+        g_pe_sn = patchlib_string_create(name);
+        g_pe_sd = (desc && *desc) ? patchlib_string_create(desc) : PATCH_NULL;
+        if (il2cpp_gchandle_new) {
+            if (g_pe_sn) g_pe_pn = il2cpp_gchandle_new(g_pe_sn, false);
+            if (g_pe_sd) g_pe_pd = il2cpp_gchandle_new(g_pe_sd, false);
+        }
+        g_pe_id = h->runtime_id;
+    }
+    if (!g_pe_sn) return;
+    patch_handle_t inst = PATCH_NULL;
+    if (f_main_inst != PATCH_NULL) {
+        unsigned char ib[64];
+        memset(ib, 0, sizeof(ib));
+        patchlib_field_get_value(f_main_inst, NULL, ib);
+        memcpy(&inst, ib, sizeof(inst));
+    }
+    if (inst == PATCH_NULL) return;
+    int rare = 0, diff = 0, mx = -1, my = -1, sw = -1, sh = -1, push = 0;
+    bool no_override = false;
+    patch_handle_t sn = g_pe_sn, sd = g_pe_sd;
+    void *args[10] = {&sn, &sd, &rare, &diff, &mx, &my, &sw, &sh, &push, &no_override};
+    patchlib_method_invoke_args(m_pe_mouse_text, inst, NULL, args);
+}
+#endif
+
+static void draw_buff_tooltip(terraria_buff_handle_t *h) {
+    if (!h) return;
+    const char *name = h->display_name ? h->display_name : h->internal_name;
+    const char *desc = h->display_description;
+    if (!name || !*name) return;
+
+#if defined(__ANDROID__)
+    show_tooltip_native(h);
+#else
+    /* PC：原版（Main.MouseText_DrawBuffTooltip）没有底板，只有两行文字，
+     * MouseText 字体、scale 1.0。 */
+    const float scale = 1.0f;
+    const float line_h = 24.0f;
+    const float x = (float) g_mx + 12.0f;
+    const float y = (float) g_my + 12.0f;
+
+    terraria_gui_text(name, x, y, scale, 0xFFFFFFFFu);
+    if (desc && *desc)
+        terraria_gui_text(desc, x, y + line_h, scale, 0xFFD8D8D8u);
+#endif
+}
+
 static int local_custom_count(void) {
     if (f_main_player == PATCH_NULL) return 0;
     const int my = main_my_player();
@@ -410,6 +590,52 @@ static int local_custom_count(void) {
         if (g_active[i].who == my_who && g_active[i].time > 0) n++;
     return n;
 }
+
+#if defined(__ANDROID__)
+/* 取 FontAssets.<name>.Value（XNA SpriteFont）。
+ * 注意：不能走属性 getter —— 泛型实例 Asset`1 上取属性会失败/拿到错对象，
+ * 手机端曾因此把 Asset 对象当 SpriteFont 传给 DrawString 直接崩。 */
+static patch_handle_t resolve_font_asset(const char *name) {
+    patch_handle_t t = patchlib_type_get_type("Terraria.GameContent", "FontAssets");
+    if (t == PATCH_NULL) return PATCH_NULL;
+    patch_handle_t f = patchlib_type_get_field(t, name);
+    patch_handle_t result = PATCH_NULL;
+    if (f != PATCH_NULL) {
+        unsigned char buf[64];
+        memset(buf, 0, sizeof(buf));
+        patchlib_field_get_value(f, NULL, buf);
+        patch_handle_t holder = PATCH_NULL;
+        memcpy(&holder, buf, sizeof(holder));
+        patch_handle_t ft = patchlib_field_get_type_handle(f);
+        const char *tn = (ft != PATCH_NULL) ? patchlib_type_get_name(ft) : NULL;
+        if (holder != PATCH_NULL && tn != NULL && strstr(tn, "Asset") != NULL) {
+            patch_handle_t vf = patchlib_type_get_field(ft, "Value");
+            if (vf != PATCH_NULL) {
+                unsigned char vb[64];
+                memset(vb, 0, sizeof(vb));
+                patchlib_field_get_value(vf, holder, vb);
+                memcpy(&result, vb, sizeof(result));
+            }
+        } else if (tn == NULL || strstr(tn, "Asset") == NULL) {
+            result = holder;
+        }
+        if (ft != PATCH_NULL) patchlib_free(ft);
+        if (f != PATCH_NULL) patchlib_free(f);
+    }
+    patchlib_free(t);
+    return result;
+}
+
+static patch_handle_t get_font(void) {
+    if (g_font != PATCH_NULL) return g_font;
+    static int tries;
+    if (tries >= 3) return PATCH_NULL;
+    tries++;
+    g_font = resolve_font_asset("ItemStack");
+    if (g_font == PATCH_NULL) g_font = resolve_font_asset("MouseText");
+    return g_font;
+}
+#endif
 
 static patch_handle_t resolve_getter_like(patch_handle_t type, const char *name) {
     patch_handle_t prop = patchlib_type_get_property(type, name);
@@ -445,6 +671,8 @@ static bool buffs_draw_prefix(patch_handle_t this, void **args,
     g_in_bar = 1;
     g_bar_base = -1;
     g_bar_epoch++;
+    g_frame_no++;
+    update_mouse_state();
     return false;
 }
 
@@ -528,7 +756,29 @@ static bool buff_item_draw_prefix(patch_handle_t this, void **args,
      * 等价于 SelectedColour(白)。NormalColour 是 40% 透明灰，直接用会压暗图标。 */
     /* 图标略微透明：原版图标是 Lerp(NormalColour, SelectedColour, buffAlpha)，
      * 不是纯白不透明；纯白会明显比旁边的原版图标亮。 */
-    unsigned tint = 0x80FFFFFFu;   /* alpha = 50% */
+    /* 原版未悬停：color = Lerp(NormalColour, SelectedColour, buffAlpha)，
+     * buffAlpha 静止值 0.4，NormalColour 的 RGB 与 A 相同 → 等价于
+     * “白色 RGB + NormalColour.A 的 alpha”。这里照抄它的 alpha。 */
+    unsigned tint = 0x66FFFFFFu;   /* 0.4，原版 buffAlpha 静止值 */
+    {
+        patch_handle_t inst_t = PATCH_NULL;
+        if (m_layout_instance != PATCH_NULL) {
+            unsigned char ibuf_t[64];
+            memset(ibuf_t, 0, sizeof(ibuf_t));
+            patchlib_method_invoke_args(m_layout_instance, NULL, ibuf_t, NULL);
+            memcpy(&inst_t, ibuf_t, sizeof(inst_t));
+        }
+        if (inst_t != PATCH_NULL) {
+            if (f_layout_normal_colour != PATCH_NULL) {
+                unsigned char cbuf_t[64];
+                memset(cbuf_t, 0, sizeof(cbuf_t));
+                patchlib_field_get_value(f_layout_normal_colour, inst_t, cbuf_t);
+                unsigned char a = cbuf_t[3];
+                if (a > 0) tint = ((unsigned) a << 24) | 0x00FFFFFFu;
+            }
+            patchlib_free(inst_t);
+        }
+    }
     if (m_layout_instance != PATCH_NULL) {
         patch_handle_t inst = PATCH_NULL;
         unsigned char ibuf[64];
@@ -546,7 +796,55 @@ static bool buff_item_draw_prefix(patch_handle_t this, void **args,
         }
     }
     if (!(item_scale > 0.0f)) item_scale = 1.0f;
-    const float size = 32.0f * item_scale;
+    float selected_scale = item_scale;
+    if (m_layout_instance != PATCH_NULL && f_layout_selected_scale != PATCH_NULL) {
+        patch_handle_t inst_s = PATCH_NULL;
+        unsigned char sb[64];
+        memset(sb, 0, sizeof(sb));
+        patchlib_method_invoke_args(m_layout_instance, NULL, sb, NULL);
+        memcpy(&inst_s, sb, sizeof(inst_s));
+        if (inst_s != PATCH_NULL) {
+            unsigned char vb[64];
+            memset(vb, 0, sizeof(vb));
+            patchlib_field_get_value(f_layout_selected_scale, inst_s, vb);
+            float v = 0.0f;
+            memcpy(&v, vb, sizeof(v));
+            if (v > 0.0f) selected_scale = v;
+            patchlib_free(inst_s);
+        }
+    }
+
+    /* 悬停高亮：复刻 Main.buffAlpha（0.4 起步，悬停 +0.1/帧，离开 -0.05/帧） */
+    const int alpha_slot = (a->buff_id & 31);
+    float hover_t = g_buff_alpha[alpha_slot];
+    if (hover_t <= 0.0f) hover_t = 0.4f;
+    const bool hovered = g_mx >= (int) pos[0] && g_mx < (int) pos[0] + 34 &&
+                         g_my >= (int) pos[1] && g_my < (int) pos[1] + 34;
+    hover_t += hovered ? 0.1f : -0.05f;
+    if (hover_t > 1.0f) hover_t = 1.0f;
+    if (hover_t < 0.4f) hover_t = 0.4f;
+    g_buff_alpha[alpha_slot] = hover_t;
+    {
+        const unsigned char a8 = (unsigned char) (hover_t * 255.0f + 0.5f);
+        tint = ((unsigned) a8 << 24) | 0x00FFFFFFu;
+    }
+    const float size = 32.0f * (item_scale + (selected_scale - item_scale) * hover_t);
+
+    /* 双击/右键取消 */
+    if (hovered && g_left_tap) {
+        if (g_last_tap_buff == a->buff_id && g_frame_no - g_last_tap_frame <= 20) {
+            patch_handle_t pl = local_player_obj();
+            if (pl != PATCH_NULL) {
+                terraria_buff_manager_remove(h, pl);
+                patchlib_free(pl);
+            }
+            g_last_tap_buff = -1;
+            terraria_gui_end_external();
+            return true;
+        }
+        g_last_tap_buff = a->buff_id;
+        g_last_tap_frame = g_frame_no;
+    }
 
     void *sb = NULL;
     if (f_sprite_batch != PATCH_NULL) {
@@ -559,6 +857,7 @@ static bool buff_item_draw_prefix(patch_handle_t this, void **args,
     /* 游戏 UI 批次已经开着：借用它，坐标/混合/字体都与原版一致 */
     terraria_gui_begin_external(sb);
 
+    if (hovered) draw_buff_tooltip(h);
     if (h->texture != PATCH_NULL)
         terraria_gui_image_raw(h->texture, pos[0], pos[1], size, size, tint);
     else
@@ -630,7 +929,16 @@ static bool buff_item_draw_prefix(patch_handle_t this, void **args,
             patchlib_free(inst2);
         }
         const float glyph_scale = item_scale * text_scale;
-        terraria_gui_text(label, pos[0] + off_x, pos[1] + off_y, glyph_scale, tint);
+#if defined(__ANDROID__)
+        patch_handle_t font = get_font();
+        if (font != PATCH_NULL) {
+            terraria_gui_draw_string(font, label, pos[0] + off_x, pos[1] + off_y,
+                                     glyph_scale, tint);
+        } else
+#endif
+        {
+            terraria_gui_text(label, pos[0] + off_x, pos[1] + off_y, glyph_scale, tint);
+        }
     }
     terraria_gui_end_external();
     return true;   /* 跳过原版（它会把 activeBuffs 越界） */
@@ -672,6 +980,8 @@ static bool pc_buffs_draw_prefix(patch_handle_t this, void **args,
     g_pc_icon_x = g_pc_icon_y = -1;
     g_pc_icon_prev_x = g_pc_icon_prev_y = -1;
     g_pc_first_x = g_pc_first_y = -1;
+    update_mouse_state();
+    g_frame_no++;
     return false;
 }
 
@@ -719,7 +1029,8 @@ static void pc_buffs_draw_postfix(patch_handle_t this, void **args, void *result
     void *sb = main_sprite_batch();
     if (!sb) return;
     terraria_gui_begin_external(sb);
-    const unsigned tint = 0x80FFFFFFu;   /* 50%，与原版 buffAlpha 观感接近 */
+    const unsigned tint = 0x66FFFFFFu;   /* 0.4：原版 buffAlpha 静止值 */
+    bool removed = false;
     for (int i = 0; i < g_active_count; ++i) {
         active_buff_t *a = &g_active[i];
         if (a->who != local_who || a->time <= 0) continue;
@@ -727,10 +1038,30 @@ static void pc_buffs_draw_postfix(patch_handle_t this, void **args, void *result
         if (!h) continue;
         const float x = (float) (base_x + (n % 11) * step);
         const float y = (float) (base_y + (n / 11) * 50);
+        const int aslot = (a->buff_id & 31);
+        float hover_t = g_buff_alpha[aslot];
+        if (hover_t <= 0.0f) hover_t = 0.4f;
+        const bool hovered = g_mx >= (int) x && g_mx < (int) x + 34 &&
+                             g_my >= (int) y && g_my < (int) y + 34;
+        hover_t += hovered ? 0.1f : -0.05f;
+        if (hover_t > 1.0f) hover_t = 1.0f;
+        if (hover_t < 0.4f) hover_t = 0.4f;
+        g_buff_alpha[aslot] = hover_t;
+        const unsigned char a8 = (unsigned char) (hover_t * 255.0f + 0.5f);
+        const unsigned pc_tint = ((unsigned) a8 << 24) | 0x00FFFFFFu;
+        /* 原版 PC 悬停只变亮、不放大（放大是 PE 的行为） */
+        const float sz = 32.0f;
+        if (hovered) draw_buff_tooltip(h);
         if (h->texture != PATCH_NULL)
-            terraria_gui_image_raw(h->texture, x, y, 32.0f, 32.0f, tint);
+            terraria_gui_image_raw(h->texture, x, y, sz, sz, pc_tint);
         else
-            terraria_gui_rect(x, y, 32.0f, 32.0f, 0xFF00FF00u);
+            terraria_gui_rect(x, y, sz, sz, 0xFF00FF00u);
+        /* 原版行为：右键点图标取消 Buff */
+        if (g_right_tap && g_mx >= (int) x && g_mx < (int) x + 32 &&
+            g_my >= (int) y && g_my < (int) y + 32) {
+            terraria_buff_manager_remove(h, local);
+            removed = true;
+        }
         if (!h->no_time_display) {
             char label[24];
             if (a->time < 3600) {
@@ -745,6 +1076,7 @@ static void pc_buffs_draw_postfix(patch_handle_t this, void **args, void *result
             terraria_gui_text(label, x, y + 32.0f, 0.8f, tint);
         }
         n++;
+        if (removed) break;
     }
     terraria_gui_end_external();
     if (local) patchlib_free(local);
@@ -763,6 +1095,20 @@ void terraria_buff_manager_init(void) {
         f_main_player = patchlib_type_get_field(main_cls, "player");
         f_sprite_batch = patchlib_type_get_field(main_cls, "spriteBatch");
         f_main_my_player = patchlib_type_get_field(main_cls, "myPlayer");
+#if !defined(__ANDROID__)
+        f_main_mouse_x = patchlib_type_get_field(main_cls, "mouseX");
+        f_main_mouse_y = patchlib_type_get_field(main_cls, "mouseY");
+        f_main_mouse_left = patchlib_type_get_field(main_cls, "mouseLeft");
+        f_main_mouse_right = patchlib_type_get_field(main_cls, "mouseRight");
+#endif
+#if defined(__ANDROID__)
+        f_main_inst = patchlib_type_get_field(main_cls, "instance");
+        m_pe_mouse_text = patchlib_type_get_method_by_param_count(main_cls, "MouseText", 10);
+        m_get_mouse_x = resolve_getter_like(main_cls, "mouseX");
+        m_get_mouse_y = resolve_getter_like(main_cls, "mouseY");
+        m_get_mouse_left = resolve_getter_like(main_cls, "mouseLeft");
+        m_get_mouse_right = resolve_getter_like(main_cls, "mouseRight");
+#endif
         m_get_my_player =
                 patchlib_type_get_method_by_param_count(main_cls, "get_myPlayer", 0);
         if (!patchlib_is_valid(m_get_my_player))
@@ -812,6 +1158,7 @@ void terraria_buff_manager_init(void) {
         if (patchlib_is_valid(lay)) {
             m_layout_instance = resolve_getter_like(lay, "Instance");
             f_layout_item_scale = patchlib_type_get_field(lay, "ItemScale");
+            f_layout_selected_scale = patchlib_type_get_field(lay, "SelectedScale");
             f_layout_normal_colour = patchlib_type_get_field(lay, "NormalColour");
             f_layout_text_scale = patchlib_type_get_field(lay, "TextScale");
             if (!patchlib_is_valid(f_layout_text_scale))

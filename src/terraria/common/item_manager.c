@@ -655,7 +655,6 @@ static void set_defaults_postfix(patch_handle_t this, void **args, void *result,
 
 /* GetRollablePrefixes 钩子：自定义物品按需补归类（数组此时已扩容） */
 
-/*
 static bool
 item_check_check_can_use_inner_prefix(patch_handle_t this, void **args,
                                       const patch_method_signature_t *sig_info,
@@ -697,7 +696,6 @@ item_check_check_can_use_inner_prefix(patch_handle_t this, void **args,
 
   return false;
 }
-*/
 
 static void get_item_name_postfix(patch_handle_t this, void **args,
                                   void *result,
@@ -714,19 +712,18 @@ static void get_item_name_postfix(patch_handle_t this, void **args,
     tefkernel_crumb("item GetItemName custom id=%d nid=%d",
                     current_item_type, nid);
 
-    patch_handle_t array_item_name_cache = PATCH_NULL;
-    patchlib_field_get_value(f_item_name_cache, NULL, &array_item_name_cache);
-
-    // 仅当缓存中确实存在条目时才覆盖原版返回值；否则保留原版
-    // GetItemName 返回的 LocalizedText.Empty，避免把结果改写成 null
-    // 造成后续 GetItemNameValue / UI 的 NullReferenceException。
+    /* 桌面端 array_at 每次都会新分配一个 GCHandle；逐帧调用会持续泄漏，
+     * 而且返回给游戏的句柄没有稳定生命周期。这里按 item type 缓存：
+     * 数组句柄只取一次，元素句柄每种类型只取一次，之后复用。 */
+    patch_handle_t arr = PATCH_NULL;
+    patchlib_field_get_value(f_item_name_cache, NULL, &arr);
+    if (arr == PATCH_NULL) return;
     patch_handle_t cached_name = PATCH_NULL;
-    if (patchlib_array_at(array_item_name_cache, current_item_type, &cached_name) &&
+    if (patchlib_array_at(arr, current_item_type, &cached_name) &&
         patchlib_is_valid(cached_name) && result) {
         *(patch_handle_t *) result = cached_name;
     }
-
-    patchlib_free(array_item_name_cache);
+    patchlib_free(arr);
 }
 
 static void content_samples_initialize_postfix(patch_handle_t this, void **args,
@@ -1577,6 +1574,23 @@ void terraria_item_manager_init() {
             patchlib_type_get_method_by_param_count(item_class, "SetDefaults", 2);
 
     patchlib_install_prepost_hook(set_defaults, NULL, set_defaults_postfix);
+
+    /* 自定义物品的 can_use：Player.ItemCheck_CheckCanUse_Inner(Item, bool) */
+    {
+        patch_handle_t t_player = patchlib_type_get_type("Terraria", "Player");
+        if (patchlib_is_valid(t_player)) {
+            patch_handle_t m_can_use = patchlib_type_get_method_by_param_count(
+                    t_player, "ItemCheck_CheckCanUse_Inner", 2);
+            if (patchlib_is_valid(m_can_use)) {
+                patchlib_install_prepost_hook(m_can_use,
+                                              item_check_check_can_use_inner_prefix, NULL);
+                TEKLOG_INFO("item: hooked Player.ItemCheck_CheckCanUse (can_use)");
+            } else {
+                TEKLOG_WARN("item: Player.ItemCheck_CheckCanUse not found");
+            }
+            patchlib_free(t_player);
+        }
+    }
 
     /* 游戏会在 Initialize_AlmostEverything 里清空 itemAnimations 整表，
      * 自定义物品的帧动画要在它之后重新注册 */

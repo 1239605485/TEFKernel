@@ -62,6 +62,16 @@ typedef struct terraria_buff_ops_t {
      * @brief 获取图标纹理实例（Asset<Texture2D>），为 NULL 时用占位图
      */
     patch_handle_t (*get_texture)(terraria_buff_handle_t *current);
+
+    /**
+     * @brief 当前语言的显示名称（UTF-8，生命周期由 loader 保证）
+     */
+    const char *(*get_display_name)(terraria_buff_handle_t *current);
+
+    /**
+     * @brief 当前语言的显示说明（UTF-8）
+     */
+    const char *(*get_display_description)(terraria_buff_handle_t *current);
 } terraria_buff_ops_t;
 
 typedef struct terraria_buff_handle_t {
@@ -81,6 +91,11 @@ typedef struct terraria_buff_handle_t {
     void *texture_pin;                 //<< Android: il2cpp GCHandle，防止图标被 GC 回收
 
     terraria_buff_ops_t buff_ops;
+
+    /* 展示文本：注册时从 get_display_* 回调**复制**成内核自有内存，
+     * 悬停时不再跨库取指针（Lua 侧重建/卸载后指针会悬空）。 */
+    char *display_name;
+    char *display_description;
 } terraria_buff_handle_t;
 
 /**
@@ -88,6 +103,12 @@ typedef struct terraria_buff_handle_t {
  * @warning 需在 Main.Initialize 之前调用（否则分配不到有效 runtime_id）
  */
 DEFINE_FUNCTION(bool, terraria_buff_manager_register_buff,
+                terraria_buff_handle_t* buff_handle)
+
+/**
+ * @brief 重新捕获显示名/说明（语言切换后调用）
+ */
+DEFINE_FUNCTION(void, terraria_buff_manager_refresh_display_text,
                 terraria_buff_handle_t* buff_handle)
 
 /**
@@ -115,6 +136,16 @@ DEFINE_FUNCTION(terraria_buff_handle_t*, terraria_buff_manager_find_buff,
  * @brief 原版 BuffID.Count（仅用于 runtime_id 起始值，不写进游戏 buffType）
  */
 DEFINE_FUNCTION(int, terraria_buff_id_get_count)
+
+/**
+ * @brief 遍历某玩家身上激活的自定义 Buff（用于伴生存档）
+ * @param player  玩家实例
+ * @param visitor 回调：user / buff 句柄 / 剩余帧数
+ */
+typedef void (*terraria_buff_active_visitor_t)(void *user, terraria_buff_handle_t *buff,
+                                               int time);
+DEFINE_FUNCTION(void, terraria_buff_manager_visit_active, patch_handle_t player,
+                terraria_buff_active_visitor_t visitor, void *user)
 
 /**
  * @brief 给玩家挂上自定义 Buff（内核自己计时，不写 buffType）
