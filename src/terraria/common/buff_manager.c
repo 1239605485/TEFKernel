@@ -295,9 +295,12 @@ int terraria_buff_manager_add(terraria_buff_handle_t *h, patch_handle_t player, 
 
 static patch_handle_t local_player_obj(void);
 
+/* 护士治疗成功：PC 走 Main.NPCChatText_DoNurseHeal，手机走 GUINPCDialogue.Option1Clicked，
+ * 但两者都会调用 AchievementsHelper.HandleNurseService —— 这是唯一的“已付费治疗”信号。 */
 void terraria_buff_manager_clear_debuffs(patch_handle_t player) {
     if (player == PATCH_NULL) return;
     const int who = player_who(player);
+    TEKLOG_INFO("buff: clear_debuffs who=%d active=%d", who, g_active_count);
     for (int i = 0; i < g_active_count;) {
         const int h_id = g_active[i].buff_id;
         terraria_buff_handle_t *h = find_by_runtime_id(h_id);
@@ -311,9 +314,9 @@ void terraria_buff_manager_clear_debuffs(patch_handle_t player) {
     }
 }
 
-/* 护士治疗：原版会清掉 buffType 里的减益，自定义减益在自管表里，需要补一次 */
-static void nurse_heal_postfix(patch_handle_t this, void **args, void *result,
-                               const patch_method_signature_t *sig) {
+/* 护士治疗成功 → 清自定义减益（原版只清 buffType 里的） */
+static void nurse_service_postfix(patch_handle_t this, void **args, void *result,
+                                  const patch_method_signature_t *sig) {
     (void) this; (void) args; (void) result; (void) sig;
     patch_handle_t local = local_player_obj();
     if (local == PATCH_NULL) return;
@@ -1162,18 +1165,21 @@ void terraria_buff_manager_init(void) {
         }
     }
 
-    /* 护士治疗：清掉自定义减益（原版只清 buffType 里的） */
+    /* 护士治疗成功（PC/手机共同入口）：AchievementsHelper.HandleNurseService(int) */
     {
-        patch_handle_t t_main = patchlib_type_get_type("Terraria", "Main");
-        patch_handle_t nurse = patchlib_is_valid(t_main)
-                ? patchlib_type_get_method_by_param_count(t_main, "NPCChatText_DoNurseHeal", 1)
-                : PATCH_NULL;
-        if (patchlib_is_valid(t_main)) patchlib_free(t_main);
-        if (patchlib_is_valid(nurse)) {
-            patchlib_install_prepost_hook(nurse, NULL, nurse_heal_postfix);
-            TEKLOG_INFO("buff: hooked Main.NPCChatText_DoNurseHeal (清除自定义减益)");
-        } else {
-            TEKLOG_WARN("buff: 未找到 Main.NPCChatText_DoNurseHeal");
+        patch_handle_t t_helper = patchlib_type_get_type(
+                "Terraria.GameContent.Achievements", "AchievementsHelper");
+        if (patchlib_is_valid(t_helper)) {
+            patch_handle_t m_service = patchlib_type_get_method_by_param_count(
+                    t_helper, "HandleNurseService", 1);
+            if (patchlib_is_valid(m_service)) {
+                const patch_hook_id_t hid =
+                        patchlib_install_prepost_hook(m_service, NULL, nurse_service_postfix);
+                TEKLOG_INFO("buff: hooked AchievementsHelper.HandleNurseService id=%d", (int) hid);
+            } else {
+                TEKLOG_WARN("buff: 未找到 AchievementsHelper.HandleNurseService");
+            }
+            patchlib_free(t_helper);
         }
     }
 
