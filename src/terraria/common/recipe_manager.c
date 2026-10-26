@@ -55,6 +55,12 @@ static patch_handle_t available_recipe_f = PATCH_NULL;
 
 static patch_handle_t recipe_cls = PATCH_NULL;
 
+static void ensure_recipe_capacity(void);
+
+static bool recipe_add_prefix(patch_handle_t this, void **args,
+                              const patch_method_signature_t *sig_info,
+                              void *result);
+
 static bool
 setup_recipes_prefix(patch_handle_t this, void **args,
                                    const patch_method_signature_t *sig_info,
@@ -86,6 +92,10 @@ void terraria_recipe_manager_init() {
 
     add_recipe =
             patchlib_type_get_method_by_param_count(recipe_cls, "AddRecipe", 0);
+    if (patchlib_is_valid(add_recipe)) {
+        patchlib_install_prepost_hook(add_recipe, recipe_add_prefix, NULL);
+        TEKLOG_INFO("recipe: hooked Recipe.AddRecipe");
+    }
 
     current_recipe_f = patchlib_type_get_field(recipe_cls, "currentRecipe");
     create_item_f = patchlib_type_get_field(recipe_cls, "createItem");
@@ -195,53 +205,87 @@ void terraria_recipe_set_station(int tile_id) {
     patchlib_free(current_recipe);
 }
 
-void terraria_recipe_add() {
-
+/* 确保 Main.recipe / Main.availableRecipe 还有空位。
+ * 所有 AddRecipe 调用（原版、内核、其他扩展）都会经过这个检查。
+ * 桌面端同时抬高 Recipe.maxRecipes；手机端 maxRecipes 是 const 3700，
+ * 改不了，只能把数组撑大避免越界（超出 3700 的配方不会进合成菜单）。 */
+static void ensure_recipe_capacity(void) {
     int num_recipes = 0;
-
     patchlib_field_get_value(num_recipes_f, PATCH_NULL, &num_recipes);
 
     patch_handle_t recipe_array = PATCH_NULL;
     patchlib_field_get_value(recipe_f, PATCH_NULL, &recipe_array);
-    const int max_recipes = (int)patchlib_array_length(recipe_array);
+    if (!patchlib_is_valid(recipe_array)) return;
 
-    if (max_recipes != 0 && num_recipes >= max_recipes) {
-        int resize_recipes = 5000 + num_recipes;
+    const int max_recipes = (int) patchlib_array_length(recipe_array);
+    if (max_recipes <= 0 || num_recipes < max_recipes) return;
 
-        patch_handle_t available_recipe_array = PATCH_NULL;
-        patchlib_field_get_value(recipe_f, PATCH_NULL, &recipe_array);
+    const int resize_recipes = max_recipes + 4096;
+
+    patch_handle_t available_recipe_array = PATCH_NULL;
 #if defined(__ANDROID__)
-        available_recipe_array = ((void*(*)())patchlib_method_get_pointer(patchlib_property_get_get_method(available_recipe_f)))();
+    available_recipe_array = ((void *(*)()) patchlib_method_get_pointer(
+            patchlib_property_get_get_method(available_recipe_f)))();
 #else
-        patchlib_field_get_value(available_recipe_f, PATCH_NULL, &available_recipe_array);
+    patchlib_field_get_value(available_recipe_f, PATCH_NULL, &available_recipe_array);
 #endif
-        patch_handle_t new_recipe_obj = patchlib_type_new_instance(recipe_cls);
-        static int zero = 0;
 
-        patch_handle_t new_recipe_array = patchlib_array_resize(recipe_array, resize_recipes, &new_recipe_obj);
-        patch_handle_t new_available_recipe_array = patchlib_array_resize(available_recipe_array, resize_recipes, &zero);
+    patch_handle_t new_recipe_obj = patchlib_type_new_instance(recipe_cls);
+    static int zero = 0;
 
-        patchlib_free(new_recipe_obj);
+    patch_handle_t new_recipe_array =
+            patchlib_array_resize(recipe_array, resize_recipes, &new_recipe_obj);
+    patch_handle_t new_available_recipe_array = patchlib_is_valid(available_recipe_array)
+            ? patchlib_array_resize(available_recipe_array, resize_recipes, &zero)
+            : PATCH_NULL;
 
-        patchlib_field_set_value(recipe_f, PATCH_NULL, &new_recipe_array);
+    patchlib_free(new_recipe_obj);
+
+    patchlib_field_set_value(recipe_f, PATCH_NULL, &new_recipe_array);
 
 #if defined(__ANDROID__)
-        ((void(*)(void*))patchlib_method_get_pointer(patchlib_property_get_set_method(available_recipe_f)))(new_available_recipe_array);
+    if (patchlib_is_valid(new_available_recipe_array))
+        ((void (*)(void *)) patchlib_method_get_pointer(
+                patchlib_property_get_set_method(available_recipe_f)))(
+                new_available_recipe_array);
 #else
-        patchlib_field_set_value(max_recipes_f, PATCH_NULL, &resize_recipes);
-        patchlib_field_set_value(available_recipe_f, PATCH_NULL, &new_available_recipe_array);
+    patchlib_field_set_value(max_recipes_f, PATCH_NULL, &resize_recipes);
+    if (patchlib_is_valid(new_available_recipe_array))
+        patchlib_field_set_value(available_recipe_f, PATCH_NULL,
+                                 &new_available_recipe_array);
 
+    if (patchlib_is_valid(available_recipe_array))
         patchlib_free(available_recipe_array);
+    if (patchlib_is_valid(new_recipe_array))
         patchlib_free(new_recipe_array);
+    if (patchlib_is_valid(new_available_recipe_array))
         patchlib_free(new_available_recipe_array);
 #endif
-    }
 
+    TEKLOG_INFO("recipe: 扩容到 %d（原 %d，已有 %d）", resize_recipes,
+                max_recipes, num_recipes);
+}
+
+/* Recipe.AddRecipe() 前置：原版追加时同样保证容量 */
+static bool recipe_add_prefix(patch_handle_t this, void **args,
+                              const patch_method_signature_t *sig_info,
+                              void *result) {
+    (void) this;
+    (void) args;
+    (void) sig_info;
+    (void) result;
+    ensure_recipe_capacity();
+    return false;
+}
+
+void terraria_recipe_add() {
+
+    /* 兜底：直接走 invoke 时也保证容量（如果 hook 没被触发） */
+    ensure_recipe_capacity();
 
 #if __ANDROID__
     ((void (*)()) patchlib_method_get_pointer(add_recipe))();
 #else
-    patchlib_free(recipe_array);
     patchlib_method_invoke_args(add_recipe, NULL, NULL, NULL);
 #endif
 }
