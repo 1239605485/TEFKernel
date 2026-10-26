@@ -43,6 +43,7 @@
 
 #include "internal/log.h"
 #include "internal/terraria/item_manager.h"
+#include "terraria/buff_manager.h"
 #include "patchlib/field.h"
 #include "patchlib/method.h"
 #include "patchlib/struct/array.h"
@@ -327,6 +328,25 @@ static int save_one_container(FILE *f, const char *tag, patch_handle_t arr,
   return saved;
 }
 
+// ------------------------------------------------------------------
+// 自定义 Buff（伴生存档）
+// ------------------------------------------------------------------
+
+struct buff_save_ctx {
+  FILE *f;
+  int count;
+};
+
+static void save_buff_line(void *user, terraria_buff_handle_t *buff, int time) {
+  struct buff_save_ctx *ctx = (struct buff_save_ctx *) user;
+  if (!ctx || !ctx->f || !buff || time <= 0) return;
+  fprintf(ctx->f, "buff\t%s\t%s\t%s\t%d\n",
+          buff->parent_modloader_id ? buff->parent_modloader_id : "?",
+          buff->parent_id ? buff->parent_id : "?",
+          buff->internal_name ? buff->internal_name : "?", time);
+  ctx->count++;
+}
+
 static void save_player_items(patch_handle_t player, patch_handle_t pfd) {
   if (!patchlib_is_valid(player))
     return;
@@ -362,8 +382,12 @@ static void save_player_items(patch_handle_t player, patch_handle_t pfd) {
     }
   }
 
+  struct buff_save_ctx bctx = {f, 0};
+  terraria_buff_manager_visit_active(player, save_buff_line, &bctx);
+
   tef_commit(f, tmp_path, final_path);
-  TEKLOG_DEBUG("item_save: saved %d custom item(s) to %s", saved, final_path);
+  TEKLOG_DEBUG("item_save: saved %d custom item(s), %d buff(s) to %s", saved,
+               bctx.count, final_path);
 }
 
 static void load_player_items(patch_handle_t player, patch_handle_t pfd) {
@@ -387,6 +411,23 @@ static void load_player_items(patch_handle_t player, patch_handle_t pfd) {
   while (fgets(line, sizeof(line), f)) {
     if (line[0] == '#')
       continue;
+
+    if (strncmp(line, "buff\t", 5) == 0) {
+      char bloader[160] = {0}, bmod[160] = {0}, bname[160] = {0};
+      int btime = 0;
+      if (sscanf(line, "buff\t%159[^\t]\t%159[^\t]\t%159[^\t]\t%d",
+                 bloader, bmod, bname, &btime) == 4 && btime > 0) {
+        terraria_buff_handle_t *bh = terraria_buff_manager_find_buff(bloader, bmod, bname);
+        if (bh) {
+          terraria_buff_manager_add(bh, player, btime);
+          restored++;
+        } else {
+          TEKLOG_WARN("item_save: buff %s.%s.%s not found (mod unloaded?)",
+                      bloader, bmod, bname);
+        }
+      }
+      continue;
+    }
 
     char tag[32] = {0};
     size_t slot = 0;

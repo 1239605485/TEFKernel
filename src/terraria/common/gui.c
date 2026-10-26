@@ -281,11 +281,7 @@ static void *text_handle(const char *text, void **temp_pin) {
 }
 
 static void text_release_temp(void *temp_pin) {
-#if defined(__ANDROID__)
-    if (temp_pin && il2cpp_gchandle_free) il2cpp_gchandle_free(temp_pin);
-#else
-    (void) temp_pin;
-#endif
+    (void) temp_pin;   /* 不释放：见 text_handle 注释，避免 use-after-free */
 }
 
 /* ------------------------------------------------------------------ */
