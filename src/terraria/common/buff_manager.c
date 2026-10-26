@@ -293,6 +293,34 @@ int terraria_buff_manager_add(terraria_buff_handle_t *h, patch_handle_t player, 
     return a->time;
 }
 
+static patch_handle_t local_player_obj(void);
+
+void terraria_buff_manager_clear_debuffs(patch_handle_t player) {
+    if (player == PATCH_NULL) return;
+    const int who = player_who(player);
+    for (int i = 0; i < g_active_count;) {
+        const int h_id = g_active[i].buff_id;
+        terraria_buff_handle_t *h = find_by_runtime_id(h_id);
+        if (g_active[i].who == who && h && h->debuff) {
+            TEKLOG_DEBUG("buff: 护士治疗清除减益 %s", h->internal_name);
+            g_active[i] = g_active[g_active_count - 1];
+            g_active_count--;
+        } else {
+            i++;
+        }
+    }
+}
+
+/* 护士治疗：原版会清掉 buffType 里的减益，自定义减益在自管表里，需要补一次 */
+static void nurse_heal_postfix(patch_handle_t this, void **args, void *result,
+                               const patch_method_signature_t *sig) {
+    (void) this; (void) args; (void) result; (void) sig;
+    patch_handle_t local = local_player_obj();
+    if (local == PATCH_NULL) return;
+    terraria_buff_manager_clear_debuffs(local);
+    patchlib_free(local);
+}
+
 void terraria_buff_manager_visit_active(patch_handle_t player,
                                         terraria_buff_active_visitor_t visitor,
                                         void *user) {
@@ -823,7 +851,7 @@ static bool buff_item_draw_prefix(patch_handle_t this, void **args,
     const float size = 32.0f * (item_scale + (selected_scale - item_scale) * hover_t);
 
     /* 双击/右键取消 */
-    if (hovered && g_left_tap) {
+    if (hovered && g_left_tap && !h->debuff) {
         if (g_last_tap_buff == a->buff_id && g_frame_no - g_last_tap_frame <= 20) {
             patch_handle_t pl = local_player_obj();
             if (pl != PATCH_NULL) {
@@ -1023,7 +1051,7 @@ static void pc_buffs_draw_postfix(patch_handle_t this, void **args, void *result
         else
             terraria_gui_rect(x, y, sz, sz, 0xFF00FF00u);
         /* 原版行为：右键点图标取消 Buff */
-        if (g_right_tap && g_mx >= (int) x && g_mx < (int) x + 32 &&
+        if (!h->debuff && g_right_tap && g_mx >= (int) x && g_mx < (int) x + 32 &&
             g_my >= (int) y && g_my < (int) y + 32) {
             terraria_buff_manager_remove(h, local);
             removed = true;
@@ -1131,6 +1159,21 @@ void terraria_buff_manager_init(void) {
                 f_layout_text_scale = patchlib_type_get_field(lay, "ItemTextScale");
             f_layout_text_offset = patchlib_type_get_field(lay, "TextOffset");
             patchlib_free(lay);
+        }
+    }
+
+    /* 护士治疗：清掉自定义减益（原版只清 buffType 里的） */
+    {
+        patch_handle_t t_main = patchlib_type_get_type("Terraria", "Main");
+        patch_handle_t nurse = patchlib_is_valid(t_main)
+                ? patchlib_type_get_method_by_param_count(t_main, "NPCChatText_DoNurseHeal", 1)
+                : PATCH_NULL;
+        if (patchlib_is_valid(t_main)) patchlib_free(t_main);
+        if (patchlib_is_valid(nurse)) {
+            patchlib_install_prepost_hook(nurse, NULL, nurse_heal_postfix);
+            TEKLOG_INFO("buff: hooked Main.NPCChatText_DoNurseHeal (清除自定义减益)");
+        } else {
+            TEKLOG_WARN("buff: 未找到 Main.NPCChatText_DoNurseHeal");
         }
     }
 
