@@ -19,7 +19,7 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fPIC")
 set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -DPIC")
 set(CMAKE_ASM_FLAGS "-x assembler-with-cpp")
 
-set(ANDROID_MODE ON)
+set(ANDROID_MODE OFF)
 if (${ANDROID_MODE})
     set(ANDROID ON)
     add_compile_definitions(__ANDROID__)
