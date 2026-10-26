@@ -24,8 +24,8 @@
 #include "patchlib/property.h"
 #include "patchlib/struct/string.h"
 #include "patchlib/type.h"
+#include "tefstd/vector.h"
 
-#define GUI_MAX_DRAW 8
 #define GUI_MAX_TEXT 96
 
 typedef struct { float x, y; } v2f;
@@ -34,7 +34,7 @@ typedef struct { uint8_t r, g, b, a; } color4;
 /* Terraria/Unity 的 UI 批次是 AlphaBlend(One, InvSrcAlpha)，纹理和**顶点色**都按
  * 预乘 alpha 处理。只改 alpha 通道不会把图画淡，反而会把背景透上来显得更亮；
  * 必须把 RGB 也乘上 alpha。 */
-static unsigned premul_color(unsigned c) {
+static unsigned premul_color(const unsigned c) {
     const unsigned a = (c >> 24) & 0xFFu;
     if (a == 255u) return c;
     const unsigned r = ((c & 0xFFu) * a + 127u) / 255u;
@@ -74,8 +74,9 @@ typedef struct {
     void *user;
 } gui_entry_t;
 
-static gui_entry_t g_entries[GUI_MAX_DRAW];
-static int g_entry_count;
+/* 绘制回调表：动态数组，元素类型 gui_entry_t */
+static tefstd_vector_t g_entries;
+static bool g_entries_ready;
 
 static patch_handle_t t_main;
 static patch_handle_t f_sprite_batch;
@@ -422,29 +423,37 @@ void terraria_gui_image_raw(patch_handle_t texture, float x, float y, float w, f
 
 void terraria_gui_add_draw(tef_gui_draw_cb cb, void *user) {
     if (!cb) return;
-    for (int i = 0; i < g_entry_count; ++i) {
-        if (g_entries[i].cb == cb) {
-            g_entries[i].user = user;
+    if (!g_entries_ready) {
+        TEKLOG_ERROR("gui: add_draw before init");
+        return;
+    }
+
+    /* 已注册：只更新 user，不占新槽位 */
+    const size_t n = tefstd_vector_size(&g_entries);
+    for (size_t i = 0; i < n; ++i) {
+        gui_entry_t *e = (gui_entry_t *) tefstd_vector_at(&g_entries, i);
+        if (e && e->cb == cb) {
+            e->user = user;
             return;
         }
     }
-    if (g_entry_count >= GUI_MAX_DRAW) {
-        TEKLOG_WARN("gui: draw callback list full (%d)", GUI_MAX_DRAW);
+
+    gui_entry_t e = {cb, user};
+    if (!tefstd_vector_push_back(&g_entries, &e)) {
+        TEKLOG_ERROR("gui: push_back failed");
         return;
     }
-    g_entries[g_entry_count].cb = cb;
-    g_entries[g_entry_count].user = user;
-    g_entry_count++;
-    TEKLOG_INFO("gui: draw callback added (%d)", g_entry_count);
+    TEKLOG_INFO("gui: draw callback added (%zu)", tefstd_vector_size(&g_entries));
 }
 
 void terraria_gui_remove_draw(tef_gui_draw_cb cb) {
-    for (int i = 0; i < g_entry_count; ++i) {
-        if (g_entries[i].cb == cb) {
-            for (int j = i; j + 1 < g_entry_count; ++j)
-                g_entries[j] = g_entries[j + 1];
-            g_entry_count--;
-            TEKLOG_INFO("gui: draw callback removed (%d)", g_entry_count);
+    if (!cb || !g_entries_ready) return;
+    const size_t n = tefstd_vector_size(&g_entries);
+    for (size_t i = 0; i < n; ++i) {
+        gui_entry_t *e = (gui_entry_t *) tefstd_vector_at(&g_entries, i);
+        if (e && e->cb == cb) {
+            tefstd_vector_erase(&g_entries, i, NULL);
+            TEKLOG_INFO("gui: draw callback removed (%zu)", tefstd_vector_size(&g_entries));
             return;
         }
     }
@@ -457,7 +466,10 @@ void terraria_gui_remove_draw(tef_gui_draw_cb cb) {
 static void frame_postfix(patch_handle_t this, void **args, void *result,
                           const patch_method_signature_t *sig) {
     (void) this; (void) args; (void) result; (void) sig;
-    if (g_in_draw || g_entry_count == 0 || f_sprite_batch == PATCH_NULL)
+    if (g_in_draw || !g_entries_ready || f_sprite_batch == PATCH_NULL)
+        return;
+    const size_t n_entries = tefstd_vector_size(&g_entries);
+    if (n_entries == 0)
         return;
     /* 启动画面 / 加载阶段：贴图与字体尚未就绪，此时绘制会抛托管异常；
      * 异常跨 hook 帧无法展开，最终 SIGABRT（闪退）。加载完成后再画。 */
@@ -499,8 +511,11 @@ static void frame_postfix(patch_handle_t this, void **args, void *result,
     g_sb = sb;
     g_in_draw = true;
     g_batch_open = false;
-    for (int i = 0; i < g_entry_count; ++i)
-        g_entries[i].cb(&g_frame, g_entries[i].user);
+    /* 快照遍历：回调内 add/remove 触发的扩容不影响本轮，且每轮用 at 重新取址 */
+    for (size_t i = 0; i < n_entries; ++i) {
+        gui_entry_t *e = (gui_entry_t *) tefstd_vector_at(&g_entries, i);
+        if (e && e->cb) e->cb(&g_frame, e->user);
+    }
     if (g_batch_open)
         sb_end();
     g_batch_open = false;
@@ -518,6 +533,13 @@ void terraria_gui_init(void) {
         TEKLOG_ERROR("gui: Terraria.Main not found");
         return;
     }
+
+    /* 回调表在 init 中初始化；失败则整个 GUI 不可用 */
+    if (!tefstd_vector_init(&g_entries, sizeof(gui_entry_t))) {
+        TEKLOG_ERROR("gui: vector_init(entries) failed");
+        return;
+    }
+    g_entries_ready = true;
 
     f_sprite_batch = resolve_field(t_main, "spriteBatch");
 
@@ -655,6 +677,9 @@ void terraria_gui_init(void) {
                      f_sprite_batch != PATCH_NULL, m_sb_begin != PATCH_NULL,
                      m_sb_begin8 != PATCH_NULL, m_sb_end != PATCH_NULL,
                      m_inv_bg != PATCH_NULL, m_border_string != PATCH_NULL);
+        /* 后端不可用：回收刚初始化的回调表 */
+        tefstd_vector_destroy(&g_entries);
+        g_entries_ready = false;
         return;
     }
 
@@ -668,6 +693,8 @@ void terraria_gui_init(void) {
     } else {
         TEKLOG_ERROR("gui: Main.Draw not found");
         g_enabled = false;
+        tefstd_vector_destroy(&g_entries);
+        g_entries_ready = false;
     }
 }
 
@@ -675,6 +702,10 @@ void terraria_gui_shutdown(void) {
     if (g_draw_hook != PATCH_HOOK_INVALID_ID) {
         patchlib_uninstall_hook(g_draw_hook);
         g_draw_hook = PATCH_HOOK_INVALID_ID;
+    }
+    if (g_entries_ready) {
+        tefstd_vector_destroy(&g_entries);
+        g_entries_ready = false;
     }
     for (int i = 0; i < g_text_count; ++i) {
         if (g_text_cache[i].pin) text_release_temp(g_text_cache[i].pin);
@@ -684,6 +715,5 @@ void terraria_gui_shutdown(void) {
         g_text_cache[i].handle = PATCH_NULL;
     }
     g_text_count = 0;
-    g_entry_count = 0;
     g_enabled = false;
 }

@@ -52,9 +52,6 @@ void terraria_texture2d_init(const bool is_server) {
 }
 
 patch_handle_t terraria_texture2d_create(int width, int height, texture_format_t texture_format, void* data, size_t data_size) {
-    TEKLOG_INFO("terraria_texture2d_create: START - %dx%d, format=%d, data_size=%zu",
-                width, height, texture_format, data_size);
-
     if (server_mode) {
         TEKLOG_INFO("terraria_texture2d_create: Server mode, returning NULL");
         return PATCH_NULL;
@@ -64,13 +61,13 @@ patch_handle_t terraria_texture2d_create(int width, int height, texture_format_t
     patch_handle_t texture2d = PATCH_NULL;
 
     // 获取 GraphicsDevice
-    TEKLOG_INFO("terraria_texture2d_create: Getting GraphicsDevice...");
+    TEKLOG_DEBUG("terraria_texture2d_create: Getting GraphicsDevice...");
     patch_handle_t graphics_device = terraria_main_get_graphics_device();
     if (!patchlib_is_valid(graphics_device)) {
         TEKLOG_ERROR("terraria_texture2d_create: Failed to get GraphicsDevice");
         return PATCH_NULL;
     }
-    TEKLOG_INFO("terraria_texture2d_create: GraphicsDevice = %p", graphics_device);
+    TEKLOG_DEBUG("terraria_texture2d_create: GraphicsDevice = %p", graphics_device);
 
     // 检查 texture2d_ctor
     if (!patchlib_is_valid(texture2d_ctor)) {
@@ -80,19 +77,10 @@ patch_handle_t terraria_texture2d_create(int width, int height, texture_format_t
     }
 
     // 调用构造函数
-    TEKLOG_INFO("terraria_texture2d_create: Calling Texture2D constructor...");
     void* args[5] = { &graphics_device, &width, &height, &mip_map, &texture_format };
 
-    // 打印参数
-    TEKLOG_INFO("terraria_texture2d_create: Constructor args:");
-    TEKLOG_INFO("  graphics_device: %p", graphics_device);
-    TEKLOG_INFO("  width: %d", width);
-    TEKLOG_INFO("  height: %d", height);
-    TEKLOG_INFO("  mip_map: %d", mip_map);
-    TEKLOG_INFO("  texture_format: %d", texture_format);
-
     bool ctor_result = patchlib_constructor_invoke(texture2d_ctor, &texture2d, args);
-    TEKLOG_INFO("terraria_texture2d_create: Constructor result: %d, texture2d=%p",
+    TEKLOG_DEBUG("terraria_texture2d_create: Constructor result: %d, texture2d=%p",
                 ctor_result, texture2d);
 
     if (!ctor_result || !patchlib_is_valid(texture2d)) {
@@ -105,11 +93,11 @@ patch_handle_t terraria_texture2d_create(int width, int height, texture_format_t
     // 验证创建的纹理尺寸
     int tex_width = terraria_texture2d_get_width(texture2d);
     int tex_height = terraria_texture2d_get_height(texture2d);
-    TEKLOG_INFO("terraria_texture2d_create: Created Texture2D: %dx%d (expected %dx%d)",
+    TEKLOG_DEBUG("terraria_texture2d_create: Created Texture2D: %dx%d (expected %dx%d)",
                 tex_width, tex_height, width, height);
 
     // 准备 SetData 泛型方法
-    TEKLOG_INFO("terraria_texture2d_create: Getting uint8 type...");
+    TEKLOG_DEBUG("terraria_texture2d_create: Getting uint8 type...");
     patch_handle_t uint8_type = patchlib_get_basic_type(PATCH_UINT8);
     if (!patchlib_is_valid(uint8_type)) {
         TEKLOG_ERROR("terraria_texture2d_create: Failed to get uint8 type");
@@ -117,13 +105,13 @@ patch_handle_t terraria_texture2d_create(int width, int height, texture_format_t
         patchlib_free(texture2d);
         return PATCH_NULL;
     }
-    TEKLOG_INFO("terraria_texture2d_create: uint8_type = %p", uint8_type);
+    TEKLOG_DEBUG("terraria_texture2d_create: uint8_type = %p", uint8_type);
 
     tefstd_vector_t generic_type;
     tefstd_vector_init(&generic_type, sizeof(patch_handle_t));
     tefstd_vector_push_back(&generic_type, &uint8_type);
 
-    TEKLOG_INFO("terraria_texture2d_create: Creating generic instance of SetData...");
+    TEKLOG_DEBUG("terraria_texture2d_create: Creating generic instance of SetData...");
     patch_handle_t set_data_uint8 = patchlib_method_make_generic_instance(texture2d_set_data, &generic_type);
     if (!patchlib_is_valid(set_data_uint8)) {
         TEKLOG_ERROR("terraria_texture2d_create: Failed to create generic SetData method!");
@@ -133,10 +121,10 @@ patch_handle_t terraria_texture2d_create(int width, int height, texture_format_t
         tefstd_vector_destroy(&generic_type);
         return PATCH_NULL;
     }
-    TEKLOG_INFO("terraria_texture2d_create: set_data_uint8 = %p", set_data_uint8);
+    TEKLOG_DEBUG("terraria_texture2d_create: set_data_uint8 = %p", set_data_uint8);
 
     // 创建数组并复制数据
-    TEKLOG_INFO("terraria_texture2d_create: Creating array of size %zu...", data_size);
+    TEKLOG_DEBUG("terraria_texture2d_create: Creating array of size %zu...", data_size);
     patch_handle_t data_array = patchlib_array_create(data_size, uint8_type);
     if (!patchlib_is_valid(data_array)) {
         TEKLOG_ERROR("terraria_texture2d_create: Failed to create data array!");
@@ -147,27 +135,26 @@ patch_handle_t terraria_texture2d_create(int width, int height, texture_format_t
         tefstd_vector_destroy(&generic_type);
         return PATCH_NULL;
     }
-    TEKLOG_INFO("terraria_texture2d_create: data_array = %p", data_array);
+    TEKLOG_DEBUG("terraria_texture2d_create: data_array = %p", data_array);
 
     TEKLOG_INFO("terraria_texture2d_create: Copying data to array...");
     bool copy_result = patchlib_array_copy_from_c(data_array, data, data_size);
-    TEKLOG_INFO("terraria_texture2d_create: Copy result: %d", copy_result);
+    TEKLOG_DEBUG("terraria_texture2d_create: Copy result: %d", copy_result);
 
     // 调用 SetData
-    TEKLOG_INFO("terraria_texture2d_create: Calling SetData...");
+    TEKLOG_DEBUG("terraria_texture2d_create: Calling SetData...");
     void* set_data_args[1] = { &data_array };
     bool set_result = patchlib_method_invoke_args(set_data_uint8, texture2d, NULL, set_data_args);
-    TEKLOG_INFO("terraria_texture2d_create: SetData result: %d", set_result);
+    TEKLOG_DEBUG("terraria_texture2d_create: SetData result: %d", set_result);
 
     // 清理资源
-    TEKLOG_INFO("terraria_texture2d_create: Cleaning up...");
+    TEKLOG_DEBUG("terraria_texture2d_create: Cleaning up...");
     patchlib_free(graphics_device);
     patchlib_free(uint8_type);
     patchlib_free(data_array);
     patchlib_free(set_data_uint8);
     tefstd_vector_destroy(&generic_type);
 
-    TEKLOG_INFO("terraria_texture2d_create: SUCCESS - returning %p", texture2d);
     return texture2d;
 }
 

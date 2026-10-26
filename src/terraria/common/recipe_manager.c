@@ -60,7 +60,7 @@ setup_recipes_prefix(patch_handle_t this, void **args,
                                    const patch_method_signature_t *sig_info,
                                    void *result) {
     for (int i = 0; i < tefstd_vector_size(&g_recipe_callback); ++i) {
-        terraria_recipe_manager_addrecipes_t callback =
+        const terraria_recipe_manager_addrecipes_t callback =
                 *(terraria_recipe_manager_addrecipes_t *) tefstd_vector_at(
                     &g_recipe_callback, i);
         if (callback)
@@ -144,11 +144,11 @@ void terraria_recipe_set_result(int item_id, int stack) {
     patchlib_free(create_item);
 }
 
-void terraria_recipe_set_material(int *materials, int count) {
+void terraria_recipe_set_material(int *materials, const int count) {
     patch_handle_t current_recipe = terraria_recipe_manager_get_current_recipe();
     patch_handle_t int_type = patchlib_get_basic_type(PATCH_INT32);
 
-    int array_size = count * 2;
+    const int array_size = count * 2;
     patch_handle_t ingredients =
             patchlib_array_create(array_size, int_type);
 
@@ -160,7 +160,7 @@ void terraria_recipe_set_material(int *materials, int count) {
 
     /* 遍历材料，设置 isAMaterial 属性 */
     for (int i = 0; i < count; i++) {
-        int item_id = materials[i * 2];
+        const int item_id = materials[i * 2];
 
         static bool material = true;
         patchlib_array_set(is_a_material, item_id, &material);
@@ -247,6 +247,6 @@ void terraria_recipe_add() {
 }
 
 void terraria_recipe_manager_register_callback(
-    terraria_recipe_manager_addrecipes_t callback) {
+    const terraria_recipe_manager_addrecipes_t callback) {
     tefstd_vector_push_back(&g_recipe_callback, &callback);
 }

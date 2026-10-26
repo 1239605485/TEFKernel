@@ -35,7 +35,7 @@ typedef struct tef_gui_frame_t {
 typedef void (*tef_gui_draw_cb)(const tef_gui_frame_t *frame, void *user);
 
 /**
- * @brief 注册每帧绘制回调（最多 8 个，按注册顺序绘制）
+ * @brief 注册每帧绘制回调（按注册顺序绘制）
  */
 DEFINE_FUNCTION(void, terraria_gui_add_draw, tef_gui_draw_cb cb, void *user)
 
