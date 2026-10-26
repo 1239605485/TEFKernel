@@ -29,6 +29,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* 桌面端的 hook 句柄在回调返回后会被自动释放，跨回调保存必须浅拷贝；
+ * Android 的句柄是持久引用，patchlib_free 为空操作。 */
+#if __ANDROID__
+#  define TEF_PROJ_HANDLE_PERSIST(h) (h)
+#else
+#  define TEF_PROJ_HANDLE_PERSIST(h) patchlib_handle_copy(h)
+#endif
+
 tefstd_vector_t g_terraria_projectile_registry;
 
 static patch_handle_t projectile_class = PATCH_NULL;
@@ -56,6 +64,7 @@ static int g_damage_depth = 0;
 
 /* HandleMovement(Vector2) 的碰撞前速度快照。 */
 static patch_handle_t g_move_projectile = PATCH_NULL;
+static bool g_move_pending = false;
 static float g_move_vx = 0.0f;
 static float g_move_vy = 0.0f;
 
@@ -764,8 +773,10 @@ static bool damage_prefix(patch_handle_t this, void **args,
     (void) args;
     (void) sig_info;
     (void) result;
-    if (g_damage_depth < TEF_MAX_DAMAGE_DEPTH)
-        g_damage_stack[g_damage_depth] = this;
+    if (g_damage_depth < TEF_MAX_DAMAGE_DEPTH) {
+        /* this 只在本次 hook 回调内有效，先持久化再跨回调使用 */
+        g_damage_stack[g_damage_depth] = TEF_PROJ_HANDLE_PERSIST(this);
+    }
     g_damage_depth++;
     return false;
 }
@@ -776,7 +787,14 @@ static void damage_postfix(patch_handle_t this, void **args, void *result,
     (void) args;
     (void) result;
     (void) sig_info;
-    if (g_damage_depth > 0) g_damage_depth--;
+    if (g_damage_depth > 0) {
+        g_damage_depth--;
+        if (g_damage_depth < TEF_MAX_DAMAGE_DEPTH) {
+            patch_handle_t held = g_damage_stack[g_damage_depth];
+            g_damage_stack[g_damage_depth] = PATCH_NULL;
+            if (held) patchlib_free(held);
+        }
+    }
 }
 
 /* NPC.StrikeNPC(...) 后置：Damage() 内被自定义弹幕命中的 NPC */
@@ -810,14 +828,18 @@ static void hurt_postfix(patch_handle_t this, void **args, void *result,
     h->projectile_ops.on_hit_player(h, proj, this, damage, hit_direction, pvp, crit);
 }
 
-/* HandleMovement(Vector2) 前置：记录碰撞前速度 */
+/* HandleMovement(Vector2) 前置：记录碰撞前速度（句柄持久化到后置） */
 static bool handle_movement_prefix(patch_handle_t this, void **args,
                                    const patch_method_signature_t *sig_info,
                                    void *result) {
     (void) args;
     (void) sig_info;
     (void) result;
-    g_move_projectile = this;
+    if (g_move_projectile) {
+        patchlib_free(g_move_projectile);
+        g_move_projectile = PATCH_NULL;
+    }
+    g_move_pending = true;
     g_move_vx = 0.0f;
     g_move_vy = 0.0f;
     if (this && patchlib_is_valid(f_velocity)) {
@@ -825,6 +847,7 @@ static bool handle_movement_prefix(patch_handle_t this, void **args,
         patchlib_field_get_value(f_velocity, this, v);
         g_move_vx = v[0];
         g_move_vy = v[1];
+        g_move_projectile = TEF_PROJ_HANDLE_PERSIST(this);
     }
     return false;
 }
@@ -833,20 +856,25 @@ static bool handle_movement_prefix(patch_handle_t this, void **args,
  * 速度变化只可能来自 TileCollision / SlopeCollision。 */
 static void handle_movement_postfix(patch_handle_t this, void **args, void *result,
                                     const patch_method_signature_t *sig_info) {
+    (void) this;
     (void) args;
     (void) result;
     (void) sig_info;
-    if (!this || this != g_move_projectile) return;
+    if (!g_move_pending) return;
+    g_move_pending = false;
+
+    patch_handle_t proj = g_move_projectile;
     g_move_projectile = PATCH_NULL;
+    if (!proj) return;
 
-    terraria_projectile_handle_t *h = custom_projectile_from(this);
-    if (!h || !h->projectile_ops.on_tile_collide) return;
-
-    float v[2] = {0.0f, 0.0f};
-    patchlib_field_get_value(f_velocity, this, v);
-    if (v[0] == g_move_vx && v[1] == g_move_vy) return;
-
-    h->projectile_ops.on_tile_collide(h, this, g_move_vx, g_move_vy);
+    terraria_projectile_handle_t *h = custom_projectile_from(proj);
+    if (h && h->projectile_ops.on_tile_collide) {
+        float v[2] = {0.0f, 0.0f};
+        patchlib_field_get_value(f_velocity, proj, v);
+        if (v[0] != g_move_vx || v[1] != g_move_vy)
+            h->projectile_ops.on_tile_collide(h, proj, g_move_vx, g_move_vy);
+    }
+    patchlib_free(proj);
 }
 
 static void ai_postfix(patch_handle_t this, void **args, void *result,
