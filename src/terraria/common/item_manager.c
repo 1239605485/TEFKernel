@@ -189,6 +189,11 @@ static terraria_item_handle_t unknown_item = {
 
 
 static patch_handle_t f_type = PATCH_NULL;
+/* Player.ItemCheck：判定“真正使用”的一次 */
+static patch_handle_t f_p_selected = PATCH_NULL;
+static patch_handle_t f_p_inventory = PATCH_NULL;
+static patch_handle_t f_p_anim = PATCH_NULL;
+static patch_handle_t f_p_anim_max = PATCH_NULL;
 static patch_handle_t f_stack = PATCH_NULL;
 static patch_handle_t m_reset_stats = PATCH_NULL;
 static patch_handle_t m_rebuild_tooltip = PATCH_NULL; // void RebuildTooltip()
@@ -695,6 +700,39 @@ item_check_check_can_use_inner_prefix(patch_handle_t this, void **args,
   }
 
   return false;
+}
+
+/* Player.ItemCheck() 后置：在使用首帧回调 item_ops.use */
+static void item_check_postfix(patch_handle_t this, void **args, void *result,
+                               const patch_method_signature_t *sig_info) {
+    (void) args; (void) result; (void) sig_info;
+    if (!this || f_p_inventory == PATCH_NULL || f_p_anim == PATCH_NULL) return;
+
+    int anim = 0, anim_max = 0, selected = -1;
+    patchlib_field_get_value(f_p_anim, this, &anim);
+    if (f_p_anim_max != PATCH_NULL) patchlib_field_get_value(f_p_anim_max, this, &anim_max);
+    if (anim <= 0 || anim != anim_max) return;      /* 只在使用的第一帧 */
+    if (f_p_selected != PATCH_NULL) patchlib_field_get_value(f_p_selected, this, &selected);
+    if (selected < 0) return;
+
+    patch_handle_t inventory = PATCH_NULL;
+    patchlib_field_get_value(f_p_inventory, this, &inventory);
+    if (!inventory) return;
+    patch_handle_t item = PATCH_NULL;
+    patchlib_array_at(inventory, (size_t) selected, &item);
+    patchlib_free(inventory);
+    if (!item) return;
+
+    int item_type = 0;
+    patchlib_field_get_value(f_type, item, &item_type);
+    const int nid = item_type - terraria_item_id_get_count();
+    const size_t count = tefstd_vector_size(&g_terraria_item_registry);
+    if (nid >= 0 && nid < (int) count) {
+        terraria_item_handle_t **pp = tefstd_vector_at(&g_terraria_item_registry, (size_t) nid);
+        if (pp && *pp && (*pp)->item_ops.use)
+            (*pp)->item_ops.use(*pp, this, item);
+    }
+    patchlib_free(item);
 }
 
 static void get_item_name_postfix(patch_handle_t this, void **args,
@@ -1574,6 +1612,23 @@ void terraria_item_manager_init() {
             patchlib_type_get_method_by_param_count(item_class, "SetDefaults", 2);
 
     patchlib_install_prepost_hook(set_defaults, NULL, set_defaults_postfix);
+
+    {
+        patch_handle_t t_player = patchlib_type_get_type("Terraria", "Player");
+        if (patchlib_is_valid(t_player)) {
+            f_p_selected  = patchlib_type_get_field(t_player, "selectedItem");
+            f_p_inventory = patchlib_type_get_field(t_player, "inventory");
+            f_p_anim      = patchlib_type_get_field(t_player, "itemAnimation");
+            f_p_anim_max  = patchlib_type_get_field(t_player, "itemAnimationMax");
+            patch_handle_t m_check = patchlib_type_get_method_by_param_count(
+                    t_player, "ItemCheck", 0);
+            if (patchlib_is_valid(m_check)) {
+                patchlib_install_prepost_hook(m_check, NULL, item_check_postfix);
+                TEKLOG_INFO("item: hooked Player.ItemCheck (on_use)");
+            }
+            patchlib_free(t_player);
+        }
+    }
 
     /* 自定义物品的 can_use：Player.ItemCheck_CheckCanUse_Inner(Item, bool) */
     {

@@ -40,6 +40,7 @@ static patch_handle_t f_texture_projectile = PATCH_NULL;  // TextureAssets.Proje
 
 static patch_hook_id_t h_set_defaults = PATCH_HOOK_INVALID_ID;
 static patch_hook_id_t h_ai = PATCH_HOOK_INVALID_ID;
+static patch_hook_id_t h_kill = PATCH_HOOK_INVALID_ID;
 static bool g_ids_assigned = false;
 
 /* Player.UpdateProjectileCaches 会做 ownedProjectileCounts[projectile.type]++，
@@ -701,6 +702,24 @@ static bool ai_prefix(patch_handle_t this, void **args,
  * 原版 Projectile.AI()（aiStyle）已经执行完毕，这里再调扩展注册的回调，
  * 扩展只需补充 vanilla 没有的行为（拾取、Buff、额外重力等）。
  */
+static void kill_postfix(patch_handle_t this, void **args, void *result,
+                         const patch_method_signature_t *sig_info) {
+    (void) args; (void) result; (void) sig_info;
+    if (!this || !patchlib_is_valid(f_type)) return;
+
+    int type = 0;
+    patchlib_field_get_value(f_type, this, &type);
+    const int nid = type - terraria_projectile_id_get_count();
+    const size_t count = tefstd_vector_size(&g_terraria_projectile_registry);
+    if (nid < 0 || nid >= (int) count) return;
+
+    terraria_projectile_handle_t **pp =
+            tefstd_vector_at(&g_terraria_projectile_registry, (size_t) nid);
+    if (!pp || !*pp) return;
+    terraria_projectile_handle_t *h = *pp;
+    if (h->projectile_ops.on_kill) h->projectile_ops.on_kill(h, this);
+}
+
 static void ai_postfix(patch_handle_t this, void **args, void *result,
                        const patch_method_signature_t *sig_info) {
     (void) args;
@@ -791,6 +810,14 @@ void terraria_projectile_manager_init() {
         TEKLOG_INFO("projectile: hooked Projectile.AI (%d)", (int) h_ai);
     }
 
+    /* Kill()：自定义弹幕销毁回调 */
+    patch_handle_t kill = patchlib_type_get_method_by_param_count(
+            projectile_class, "Kill", 0);
+    if (patchlib_is_valid(kill)) {
+        h_kill = patchlib_install_prepost_hook(kill, NULL, kill_postfix);
+        TEKLOG_INFO("projectile: hooked Projectile.Kill (%d)", (int) h_kill);
+    }
+
     TEKLOG_INFO("projectile: init done (base=%d, custom=%zu)",
                 terraria_projectile_id_get_count(),
                 tefstd_vector_size(&g_terraria_projectile_registry));
@@ -800,6 +827,10 @@ void terraria_projectile_manager_destroy() {
     if (h_set_defaults != PATCH_HOOK_INVALID_ID) {
         patchlib_uninstall_hook(h_set_defaults);
         h_set_defaults = PATCH_HOOK_INVALID_ID;
+    }
+    if (h_kill != PATCH_HOOK_INVALID_ID) {
+        patchlib_uninstall_hook(h_kill);
+        h_kill = PATCH_HOOK_INVALID_ID;
     }
     if (h_ai != PATCH_HOOK_INVALID_ID) {
         patchlib_uninstall_hook(h_ai);

@@ -53,6 +53,12 @@ typedef struct terraria_projectile_ops_t {
      * @brief 获取纹理实例（Asset<Texture2D>），为 NULL 时用占位贴图
      */
     patch_handle_t (*get_texture)(terraria_projectile_handle_t *current);
+
+    /**
+     * @brief 弹幕被杀掉时回调一次（命中消失、超时、手动 Kill 都会触发）
+     * @warning instance 由 hook 管理器释放，不要持有
+     */
+    void (*on_kill)(terraria_projectile_handle_t *current, patch_handle_t instance);
 } terraria_projectile_ops_t;
 
 typedef struct terraria_projectile_handle_t {
