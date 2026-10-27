@@ -320,7 +320,7 @@ static void resize_static_array(patch_handle_t field, const char *name,
         return;
     }
     const size_t len = patchlib_array_length(array);
-    if (len != (size_t) base) {
+    if (len + 8 < (size_t) base || len >= (size_t) new_size) {
         TEKLOG_DEBUG("projectile resize: %s len=%zu != base=%d, skip",
                      name ? name : "?", len, base);
         patchlib_free(array);
@@ -397,7 +397,7 @@ void terraria_projectile_manager_resize() {
             continue;
         }
         const size_t len = patchlib_array_length(array);
-        if (len == (size_t) base) {
+        if (len + 8 >= (size_t) base && len < (size_t) new_size) {
             patch_handle_t bigger =
                     patchlib_array_resize(array, (size_t) new_size, NULL);
             if (patchlib_is_valid(bigger)) {

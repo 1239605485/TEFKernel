@@ -1111,6 +1111,7 @@ void tpf_init_libtefkernel() {
     TPF_KERNEL_SYMBOL(terraria_npc_manager_find_npc);
     TPF_KERNEL_SYMBOL(terraria_npc_id_get_count);
     TPF_KERNEL_SYMBOL(terraria_npc_manager_spawn);
+    TPF_KERNEL_SYMBOL(terraria_npc_manager_drop_item);
     // buff_manager
     TPF_KERNEL_SYMBOL(terraria_buff_manager_register_buff);
     TPF_KERNEL_SYMBOL(terraria_buff_manager_unregister_buff_by_id);
