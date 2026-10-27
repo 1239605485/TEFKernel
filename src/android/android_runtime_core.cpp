@@ -49,6 +49,7 @@
 #include "internal/terraria/texture2d.h"
 #include "internal/terraria/item_manager.h"
 #include "internal/terraria/projectile_manager.h"
+#include "internal/terraria/npc_manager.h"
 #include "internal/terraria/buff_manager.h"
 #include "internal/terraria/gui.h"
 #include "internal/terraria/item_save.h"
@@ -160,6 +161,7 @@ static int hook_il2cpp_init(const char* domain_name) {
     terraria_asset_init();
     terraria_item_manager_init();
     terraria_projectile_manager_init();
+    terraria_npc_manager_init();
     terraria_buff_manager_init();
     terraria_gui_init();
     terraria_item_save_init();

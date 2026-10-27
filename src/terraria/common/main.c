@@ -29,6 +29,7 @@
 #include "internal/terraria/item_manager.h"
 #include "internal/terraria/projectile_manager.h"
 #include "internal/terraria/buff_manager.h"
+#include "internal/terraria/npc_manager.h"
 #include "patchlib/property.h"
 
 static patch_handle_t get_graphics_device = PATCH_NULL;
@@ -42,10 +43,12 @@ static bool initialize_prefix(patch_handle_t this, void **args,
     size_t custom_count = tefstd_vector_size(&g_terraria_item_registry);
     size_t custom_proj = tefstd_vector_size(&g_terraria_projectile_registry);
     size_t custom_buff = tefstd_vector_size(&g_terraria_buff_registry);
+    size_t custom_npc = tefstd_vector_size(&g_terraria_npc_registry);
 
-    TEKLOG_INFO("Main.Initialize: %d base + %zu custom items, %d base + %zu custom projectiles, %d base + %zu custom buffs",
+    TEKLOG_INFO("Main.Initialize: %d base + %zu custom items, %d base + %zu custom projectiles, %d base + %zu custom buffs, %d base + %zu custom npcs",
                 base_count, custom_count, terraria_projectile_id_get_count(), custom_proj,
-                terraria_buff_id_get_count(), custom_buff);
+                terraria_buff_id_get_count(), custom_buff,
+                terraria_npc_id_get_count(), custom_npc);
 
     if (custom_count > 0) {
         terraria_item_manager_assign_ids(base_count);
@@ -64,6 +67,11 @@ static bool initialize_prefix(patch_handle_t this, void **args,
     if (custom_buff > 0) {
         terraria_buff_manager_assign_ids(terraria_buff_id_get_count());
         TEKLOG_INFO("Assigned buff IDs (不占用原版 BuffID)");
+    }
+
+    if (custom_npc > 0) {
+        terraria_npc_manager_assign_ids(terraria_npc_id_get_count());
+        TEKLOG_INFO("Assigned NPC IDs");
     }
 
     const size_t count = tefstd_vector_size(&g_terraria_item_registry);
@@ -101,6 +109,18 @@ static bool initialize_prefix(patch_handle_t this, void **args,
     }
     TEKLOG_INFO("Initialized %d custom buffs", buff_initialized);
 
+    const size_t npc_count = tefstd_vector_size(&g_terraria_npc_registry);
+    int npc_initialized = 0;
+    for (size_t i = 0; i < npc_count; ++i) {
+        terraria_npc_handle_t** npc_handle =
+                tefstd_vector_at(&g_terraria_npc_registry, i);
+        if (*npc_handle && (*npc_handle)->npc_ops.early_init) {
+            (*npc_handle)->npc_ops.early_init(*npc_handle);
+            npc_initialized++;
+        }
+    }
+    TEKLOG_INFO("Initialized %d custom npcs", npc_initialized);
+
     return false;
 }
 
@@ -113,13 +133,16 @@ static void initialize_postfix(patch_handle_t this, void **args, void *result,
     const size_t custom_count = tefstd_vector_size(&g_terraria_item_registry);
     const size_t custom_proj = tefstd_vector_size(&g_terraria_projectile_registry);
     const size_t custom_buff = tefstd_vector_size(&g_terraria_buff_registry);
-    if (custom_count == 0 && custom_proj == 0 && custom_buff == 0)
+    const size_t custom_npc = tefstd_vector_size(&g_terraria_npc_registry);
+    if (custom_count == 0 && custom_proj == 0 && custom_buff == 0 && custom_npc == 0)
         return;
     TEKLOG_INFO("Main.Initialize completed, final resizing pass...");
     if (custom_count > 0)
         terraria_item_manager_resize(true);
     if (custom_proj > 0)
         terraria_projectile_manager_resize();
+    if (custom_npc > 0)
+        terraria_npc_manager_resize();
 
 }
 
@@ -131,6 +154,7 @@ static void initialize_almost_everything_postfix(patch_handle_t this, void **arg
     size_t custom_count = tefstd_vector_size(&g_terraria_item_registry);
     size_t custom_proj = tefstd_vector_size(&g_terraria_projectile_registry);
     size_t custom_buff = tefstd_vector_size(&g_terraria_buff_registry);
+    size_t custom_npc = tefstd_vector_size(&g_terraria_npc_registry);
 
     if (custom_count > 0) {
         terraria_item_manager_resize(true);
@@ -155,6 +179,12 @@ static void initialize_almost_everything_postfix(patch_handle_t this, void **arg
     if (custom_buff > 0) {
         terraria_buff_manager_init_texture2d();
         TEKLOG_INFO("Custom buff textures initialized");
+    }
+
+    if (custom_npc > 0) {
+        terraria_npc_manager_resize();
+        terraria_npc_manager_init_texture2d();
+        TEKLOG_INFO("Custom NPC arrays resized and textures initialized");
     }
 
     // 初始化静态数据
@@ -194,6 +224,18 @@ static void initialize_almost_everything_postfix(patch_handle_t this, void **arg
         }
     }
     TEKLOG_INFO("Initialized %d custom buffs", buff_initialized);
+
+    const size_t npc_count = tefstd_vector_size(&g_terraria_npc_registry);
+    int npc_initialized = 0;
+    for (size_t i = 0; i < npc_count; ++i) {
+        terraria_npc_handle_t** npc_handle =
+                tefstd_vector_at(&g_terraria_npc_registry, i);
+        if (*npc_handle && (*npc_handle)->npc_ops.init_static) {
+            (*npc_handle)->npc_ops.init_static(*npc_handle);
+            npc_initialized++;
+        }
+    }
+    TEKLOG_INFO("Initialized %d custom npcs", npc_initialized);
 
     /* 归类"可重铸类别"：必须放在 init_static 之后 ——
      * 加载器是在 init_static 里通过 terraria_item_manager_set_prefix_class()
