@@ -138,6 +138,11 @@ DEFINE_FUNCTION(terraria_buff_handle_t*, terraria_buff_manager_find_buff,
 DEFINE_FUNCTION(int, terraria_buff_id_get_count)
 
 /**
+ * @brief 清除某玩家身上的全部自定义减益（护士治疗等场景）
+ */
+DEFINE_FUNCTION(void, terraria_buff_manager_clear_debuffs, patch_handle_t player)
+
+/**
  * @brief 遍历某玩家身上激活的自定义 Buff（用于伴生存档）
  * @param player  玩家实例
  * @param visitor 回调：user / buff 句柄 / 剩余帧数

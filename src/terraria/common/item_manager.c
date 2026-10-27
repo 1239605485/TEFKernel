@@ -21,6 +21,7 @@
  *******************************************************************************/
 
 #include "internal/terraria/item_manager.h"
+#include "internal/terraria/npc_manager.h"
 #include "terraria/language_manager.h"
 #include "terraria/recipe_manager.h"
 
@@ -697,6 +698,32 @@ item_check_check_can_use_inner_prefix(patch_handle_t this, void **args,
   return false;
 }
 
+/* Player.ItemCheck_StartActualUse(Item)：真正的「开始使用」入口，比看
+ * itemAnimation 更可靠（ItemCheck 返回前 animation 已经 -1 了，
+ * 之前用 anim == itemAnimationMax 永远不成立）。 */
+static void start_actual_use_postfix(patch_handle_t this, void **args, void *result,
+                                     const patch_method_signature_t *sig_info) {
+    (void) this;
+    (void) result;
+    (void) sig_info;
+    if (!args || !args[0]) return;
+    patch_handle_t item = *(patch_handle_t *) args[0];
+    if (!item) return;
+
+    int item_type = 0;
+    patchlib_field_get_value(f_type, item, &item_type);
+    const int nid = item_type - terraria_item_id_get_count();
+    const size_t count = tefstd_vector_size(&g_terraria_item_registry);
+    if (nid < 0 || nid >= (int) count) return;
+
+    terraria_item_handle_t **pp =
+            tefstd_vector_at(&g_terraria_item_registry, (size_t) nid);
+    if (!pp || !*pp) return;
+    TEKLOG_DEBUG("item use: type=%d", item_type);
+    if ((*pp)->item_ops.use)
+        (*pp)->item_ops.use(*pp, this, item);
+}
+
 static void get_item_name_postfix(patch_handle_t this, void **args,
                                   void *result,
                                   const patch_method_signature_t *sig_info) {
@@ -708,9 +735,6 @@ static void get_item_name_postfix(patch_handle_t this, void **args,
     if (nid < 0 || nid >= (int) custom_count) {
         return;
     }
-
-    tefkernel_crumb("item GetItemName custom id=%d nid=%d",
-                    current_item_type, nid);
 
     /* 桌面端 array_at 每次都会新分配一个 GCHandle；逐帧调用会持续泄漏，
      * 而且返回给游戏的句柄没有稳定生命周期。这里按 item type 缓存：
@@ -1031,6 +1055,9 @@ static void load_textures_postfix(patch_handle_t this, void **args,
     TEKLOG_INFO("AssetInitializer.LoadTextures postfix: re-applying custom item "
         "textures");
     terraria_item_manager_init_texture2d();
+    /* LoadTextures 会用 Images/NPC_x / Projectile_x 把整个数组覆盖一遍，
+     * 自定义 id 没有对应文件，必须在这里重新写回。 */
+    terraria_npc_manager_init_texture2d();
 }
 #endif
 
@@ -1205,11 +1232,21 @@ static void resize_all_class_sets(const char *ns, const char *cls,
             continue;
         }
 
-        // 检查数组长度是否匹配 base_count
+        // 检查数组长度是否匹配 base_count。
+        // 允许 ±8 的偏差：1.4.5.8 里有几张表长度是 6195/6197，
+        // 严格相等会漏掉它们；自定义 id 一索引就 IndexOutOfRange，
+        // 异常被 Main.ignoreErrors 吞掉，表现为 ItemCheck 半途中断。
         const size_t len = patchlib_array_length(array);
-        if (len != (size_t) base_count) {
-            TEKLOG_DEBUG("resize_all_itemid_sets: skipping %s (len=%zu, expected=%d)",
-                         name ? name : "?", len, base_count);
+        const bool near_base =
+                len + 8 >= (size_t) base_count && len < (size_t) new_size;
+        if (!near_base) {
+            if (len < (size_t) new_size && len + 32 >= (size_t) base_count) {
+                TEKLOG_WARN("ItemID.Sets.%s len=%zu (base=%d) 未扩容",
+                            name ? name : "?", len, base_count);
+            } else {
+                TEKLOG_DEBUG("resize_all_itemid_sets: skipping %s (len=%zu, expected=%d)",
+                             name ? name : "?", len, base_count);
+            }
             patchlib_free(field);
             patchlib_free(array);
             skipped++;
@@ -1231,6 +1268,9 @@ static void resize_all_class_sets(const char *ns, const char *cls,
             // 新槽按该集合默认值（原数组众数）填充，而不是 0
             fill_new_slots_with_modal(array, new_array, len, (size_t) new_size);
             patchlib_field_set_value(field, NULL, &new_array);
+            if (len != (size_t) base_count)
+                TEKLOG_INFO("ItemID.Sets.%s len=%zu -> %d (near-base)",
+                            name ? name : "?", len, new_size);
             TEKLOG_DEBUG(
                 "resize_all_itemid_sets: ✅ resized ItemID.Sets.%s (%zu -> %d)",
                 name ? name : "?", len, new_size);
@@ -1574,6 +1614,22 @@ void terraria_item_manager_init() {
             patchlib_type_get_method_by_param_count(item_class, "SetDefaults", 2);
 
     patchlib_install_prepost_hook(set_defaults, NULL, set_defaults_postfix);
+
+    {
+        patch_handle_t t_player = patchlib_type_get_type("Terraria", "Player");
+        if (patchlib_is_valid(t_player)) {
+            patch_handle_t m_start = patchlib_type_get_method_by_param_count(
+                    t_player, "ItemCheck_StartActualUse", 1);
+            if (patchlib_is_valid(m_start)) {
+                patchlib_install_prepost_hook(m_start, NULL,
+                                              start_actual_use_postfix);
+                TEKLOG_INFO("item: hooked ItemCheck_StartActualUse (use)");
+            } else {
+                TEKLOG_WARN("item: ItemCheck_StartActualUse not found");
+            }
+            patchlib_free(t_player);
+        }
+    }
 
     /* 自定义物品的 can_use：Player.ItemCheck_CheckCanUse_Inner(Item, bool) */
     {

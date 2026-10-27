@@ -29,6 +29,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* 桌面端的 hook 句柄在回调返回后会被自动释放，跨回调保存必须浅拷贝；
+ * Android 的句柄是持久引用，patchlib_free 为空操作。 */
+#if __ANDROID__
+#  define TEF_PROJ_HANDLE_PERSIST(h) (h)
+#else
+#  define TEF_PROJ_HANDLE_PERSIST(h) patchlib_handle_copy(h)
+#endif
+
 tefstd_vector_t g_terraria_projectile_registry;
 
 static patch_handle_t projectile_class = PATCH_NULL;
@@ -40,7 +48,25 @@ static patch_handle_t f_texture_projectile = PATCH_NULL;  // TextureAssets.Proje
 
 static patch_hook_id_t h_set_defaults = PATCH_HOOK_INVALID_ID;
 static patch_hook_id_t h_ai = PATCH_HOOK_INVALID_ID;
+static patch_hook_id_t h_kill = PATCH_HOOK_INVALID_ID;
+static patch_hook_id_t h_damage = PATCH_HOOK_INVALID_ID;
+static patch_hook_id_t h_strike_npc = PATCH_HOOK_INVALID_ID;
+static patch_hook_id_t h_hurt = PATCH_HOOK_INVALID_ID;
+static patch_hook_id_t h_move = PATCH_HOOK_INVALID_ID;
 static bool g_ids_assigned = false;
+
+static patch_handle_t f_velocity = PATCH_NULL;  // Projectile.velocity (Vector2)
+
+/* Damage() 可能嵌套（炸弹在 Kill() 里再调 Damage），用浅栈保存当前结算弹幕。 */
+#define TEF_MAX_DAMAGE_DEPTH 8
+static patch_handle_t g_damage_stack[TEF_MAX_DAMAGE_DEPTH];
+static int g_damage_depth = 0;
+
+/* HandleMovement(Vector2) 的碰撞前速度快照。 */
+static patch_handle_t g_move_projectile = PATCH_NULL;
+static bool g_move_pending = false;
+static float g_move_vx = 0.0f;
+static float g_move_vy = 0.0f;
 
 /* Player.UpdateProjectileCaches 会做 ownedProjectileCounts[projectile.type]++，
  * 而游戏进入世界时会替换本地玩家实例（拿到的是原版长度的数组）。
@@ -294,7 +320,7 @@ static void resize_static_array(patch_handle_t field, const char *name,
         return;
     }
     const size_t len = patchlib_array_length(array);
-    if (len != (size_t) base) {
+    if (len + 8 < (size_t) base || len >= (size_t) new_size) {
         TEKLOG_DEBUG("projectile resize: %s len=%zu != base=%d, skip",
                      name ? name : "?", len, base);
         patchlib_free(array);
@@ -371,7 +397,7 @@ void terraria_projectile_manager_resize() {
             continue;
         }
         const size_t len = patchlib_array_length(array);
-        if (len == (size_t) base) {
+        if (len + 8 >= (size_t) base && len < (size_t) new_size) {
             patch_handle_t bigger =
                     patchlib_array_resize(array, (size_t) new_size, NULL);
             if (patchlib_is_valid(bigger)) {
@@ -701,6 +727,156 @@ static bool ai_prefix(patch_handle_t this, void **args,
  * 原版 Projectile.AI()（aiStyle）已经执行完毕，这里再调扩展注册的回调，
  * 扩展只需补充 vanilla 没有的行为（拾取、Buff、额外重力等）。
  */
+static void kill_postfix(patch_handle_t this, void **args, void *result,
+                         const patch_method_signature_t *sig_info) {
+    (void) args; (void) result; (void) sig_info;
+    if (!this || !patchlib_is_valid(f_type)) return;
+
+    int type = 0;
+    patchlib_field_get_value(f_type, this, &type);
+    const int nid = type - terraria_projectile_id_get_count();
+    const size_t count = tefstd_vector_size(&g_terraria_projectile_registry);
+    if (nid < 0 || nid >= (int) count) return;
+
+    terraria_projectile_handle_t **pp =
+            tefstd_vector_at(&g_terraria_projectile_registry, (size_t) nid);
+    if (!pp || !*pp) return;
+    terraria_projectile_handle_t *h = *pp;
+    if (h->projectile_ops.on_kill) h->projectile_ops.on_kill(h, this);
+}
+
+/* 由「当前结算中的弹幕」找到自定义句柄；非自定义返回 NULL */
+static terraria_projectile_handle_t *custom_projectile_from(patch_handle_t proj) {
+    if (!proj || !patchlib_is_valid(f_type)) return NULL;
+
+    int type = 0;
+    patchlib_field_get_value(f_type, proj, &type);
+    const int nid = type - terraria_projectile_id_get_count();
+    const size_t count = tefstd_vector_size(&g_terraria_projectile_registry);
+    if (nid < 0 || nid >= (int) count) return NULL;
+
+    terraria_projectile_handle_t **pp =
+            tefstd_vector_at(&g_terraria_projectile_registry, (size_t) nid);
+    return (pp && *pp) ? *pp : NULL;
+}
+
+static patch_handle_t current_damage_projectile(void) {
+    if (g_damage_depth <= 0 || g_damage_depth > TEF_MAX_DAMAGE_DEPTH)
+        return PATCH_NULL;
+    return g_damage_stack[g_damage_depth - 1];
+}
+
+/* Projectile.Damage() 前置：标记当前正在结算伤害的弹幕 */
+static bool damage_prefix(patch_handle_t this, void **args,
+                          const patch_method_signature_t *sig_info,
+                          void *result) {
+    (void) args;
+    (void) sig_info;
+    (void) result;
+    if (g_damage_depth < TEF_MAX_DAMAGE_DEPTH) {
+        /* this 只在本次 hook 回调内有效，先持久化再跨回调使用 */
+        g_damage_stack[g_damage_depth] = TEF_PROJ_HANDLE_PERSIST(this);
+    }
+    g_damage_depth++;
+    return false;
+}
+
+static void damage_postfix(patch_handle_t this, void **args, void *result,
+                           const patch_method_signature_t *sig_info) {
+    (void) this;
+    (void) args;
+    (void) result;
+    (void) sig_info;
+    if (g_damage_depth > 0) {
+        g_damage_depth--;
+        if (g_damage_depth < TEF_MAX_DAMAGE_DEPTH) {
+            patch_handle_t held = g_damage_stack[g_damage_depth];
+            g_damage_stack[g_damage_depth] = PATCH_NULL;
+            if (held) patchlib_free(held);
+        }
+    }
+}
+
+/* NPC.StrikeNPC(...) 后置：Damage() 内被自定义弹幕命中的 NPC */
+static void strike_npc_postfix(patch_handle_t this, void **args, void *result,
+                               const patch_method_signature_t *sig_info) {
+    (void) result;
+    (void) sig_info;
+    patch_handle_t proj = current_damage_projectile();
+    terraria_projectile_handle_t *h = custom_projectile_from(proj);
+    if (!h || !h->projectile_ops.on_hit_npc) return;
+
+    int damage = (args && args[0]) ? *(int *) args[0] : 0;
+    int hit_direction = (args && args[2]) ? *(int *) args[2] : 0;
+    bool crit = (args && args[3]) ? *(bool *) args[3] : false;
+    h->projectile_ops.on_hit_npc(h, proj, this, damage, hit_direction, crit);
+}
+
+/* Player.Hurt(...) 后置：Damage() 内被自定义弹幕命中的玩家 */
+static void hurt_postfix(patch_handle_t this, void **args, void *result,
+                         const patch_method_signature_t *sig_info) {
+    (void) result;
+    (void) sig_info;
+    patch_handle_t proj = current_damage_projectile();
+    terraria_projectile_handle_t *h = custom_projectile_from(proj);
+    if (!h || !h->projectile_ops.on_hit_player) return;
+
+    int damage = (args && args[1]) ? *(int *) args[1] : 0;
+    int hit_direction = (args && args[2]) ? *(int *) args[2] : 0;
+    bool pvp = (args && args[3]) ? *(bool *) args[3] : false;
+    bool crit = (args && args[5]) ? *(bool *) args[5] : false;
+    h->projectile_ops.on_hit_player(h, proj, this, damage, hit_direction, pvp, crit);
+}
+
+/* HandleMovement(Vector2) 前置：记录碰撞前速度（句柄持久化到后置） */
+static bool handle_movement_prefix(patch_handle_t this, void **args,
+                                   const patch_method_signature_t *sig_info,
+                                   void *result) {
+    (void) args;
+    (void) sig_info;
+    (void) result;
+    if (g_move_projectile) {
+        patchlib_free(g_move_projectile);
+        g_move_projectile = PATCH_NULL;
+    }
+    g_move_pending = true;
+    g_move_vx = 0.0f;
+    g_move_vy = 0.0f;
+    if (this && patchlib_is_valid(f_velocity)) {
+        float v[2] = {0.0f, 0.0f};
+        patchlib_field_get_value(f_velocity, this, v);
+        g_move_vx = v[0];
+        g_move_vy = v[1];
+        g_move_projectile = TEF_PROJ_HANDLE_PERSIST(this);
+    }
+    return false;
+}
+
+/* HandleMovement(Vector2) 后置：自定义 type 不匹配任何原版分支，
+ * 速度变化只可能来自 TileCollision / SlopeCollision。 */
+static void handle_movement_postfix(patch_handle_t this, void **args, void *result,
+                                    const patch_method_signature_t *sig_info) {
+    (void) this;
+    (void) args;
+    (void) result;
+    (void) sig_info;
+    if (!g_move_pending) return;
+    g_move_pending = false;
+
+    patch_handle_t proj = g_move_projectile;
+    g_move_projectile = PATCH_NULL;
+    if (!proj) return;
+
+    terraria_projectile_handle_t *h = custom_projectile_from(proj);
+    if (h && h->projectile_ops.on_tile_collide) {
+        float v[2] = {0.0f, 0.0f};
+        patchlib_field_get_value(f_velocity, proj, v);
+        if (v[0] != g_move_vx || v[1] != g_move_vy)
+            h->projectile_ops.on_tile_collide(h, proj, g_move_vx, g_move_vy);
+    }
+    patchlib_free(proj);
+}
+
 static void ai_postfix(patch_handle_t this, void **args, void *result,
                        const patch_method_signature_t *sig_info) {
     (void) args;
@@ -791,6 +967,62 @@ void terraria_projectile_manager_init() {
         TEKLOG_INFO("projectile: hooked Projectile.AI (%d)", (int) h_ai);
     }
 
+    /* Kill()：自定义弹幕销毁回调 */
+    patch_handle_t kill = patchlib_type_get_method_by_param_count(
+            projectile_class, "Kill", 0);
+    if (patchlib_is_valid(kill)) {
+        h_kill = patchlib_install_prepost_hook(kill, NULL, kill_postfix);
+        TEKLOG_INFO("projectile: hooked Projectile.Kill (%d)", (int) h_kill);
+    }
+
+    f_velocity = patchlib_type_get_field(projectile_class, "velocity");
+
+    /* Damage()：命中回调的上下文（Damage 内部才调 StrikeNPC / Hurt） */
+    patch_handle_t damage = patchlib_type_get_method_by_param_count(
+            projectile_class, "Damage", 0);
+    if (patchlib_is_valid(damage)) {
+        h_damage = patchlib_install_prepost_hook(damage, damage_prefix,
+                                                 damage_postfix);
+        TEKLOG_INFO("projectile: hooked Projectile.Damage (%d)", (int) h_damage);
+    }
+
+    /* HandleMovement(Vector2)：撞墙回调（Update 每帧调用，早于 Damage） */
+    patch_handle_t handle_movement = patchlib_type_get_method_by_param_count(
+            projectile_class, "HandleMovement", 1);
+    if (patchlib_is_valid(handle_movement)) {
+        h_move = patchlib_install_prepost_hook(handle_movement,
+                                               handle_movement_prefix,
+                                               handle_movement_postfix);
+        TEKLOG_INFO("projectile: hooked Projectile.HandleMovement (%d)",
+                    (int) h_move);
+    }
+
+    /* NPC.StrikeNPC(int,float,int,bool,bool,int)：弹幕命中 NPC 的落点 */
+    patch_handle_t npc_cls = patchlib_type_get_type("Terraria", "NPC");
+    if (patchlib_is_valid(npc_cls)) {
+        patch_handle_t strike_npc = patchlib_type_get_method_by_param_count(
+                npc_cls, "StrikeNPC", 6);
+        if (patchlib_is_valid(strike_npc)) {
+            h_strike_npc = patchlib_install_prepost_hook(strike_npc, NULL,
+                                                         strike_npc_postfix);
+            TEKLOG_INFO("projectile: hooked NPC.StrikeNPC (%d)",
+                        (int) h_strike_npc);
+        }
+        patchlib_free(npc_cls);
+    }
+
+    /* Player.Hurt(...)：PvP 与敌弹打玩家的落点 */
+    patch_handle_t hurt_player_cls = patchlib_type_get_type("Terraria", "Player");
+    if (patchlib_is_valid(hurt_player_cls)) {
+        patch_handle_t hurt = patchlib_type_get_method_by_param_count(
+                hurt_player_cls, "Hurt", 8);
+        if (patchlib_is_valid(hurt)) {
+            h_hurt = patchlib_install_prepost_hook(hurt, NULL, hurt_postfix);
+            TEKLOG_INFO("projectile: hooked Player.Hurt (%d)", (int) h_hurt);
+        }
+        patchlib_free(hurt_player_cls);
+    }
+
     TEKLOG_INFO("projectile: init done (base=%d, custom=%zu)",
                 terraria_projectile_id_get_count(),
                 tefstd_vector_size(&g_terraria_projectile_registry));
@@ -800,6 +1032,26 @@ void terraria_projectile_manager_destroy() {
     if (h_set_defaults != PATCH_HOOK_INVALID_ID) {
         patchlib_uninstall_hook(h_set_defaults);
         h_set_defaults = PATCH_HOOK_INVALID_ID;
+    }
+    if (h_kill != PATCH_HOOK_INVALID_ID) {
+        patchlib_uninstall_hook(h_kill);
+        h_kill = PATCH_HOOK_INVALID_ID;
+    }
+    if (h_hurt != PATCH_HOOK_INVALID_ID) {
+        patchlib_uninstall_hook(h_hurt);
+        h_hurt = PATCH_HOOK_INVALID_ID;
+    }
+    if (h_strike_npc != PATCH_HOOK_INVALID_ID) {
+        patchlib_uninstall_hook(h_strike_npc);
+        h_strike_npc = PATCH_HOOK_INVALID_ID;
+    }
+    if (h_move != PATCH_HOOK_INVALID_ID) {
+        patchlib_uninstall_hook(h_move);
+        h_move = PATCH_HOOK_INVALID_ID;
+    }
+    if (h_damage != PATCH_HOOK_INVALID_ID) {
+        patchlib_uninstall_hook(h_damage);
+        h_damage = PATCH_HOOK_INVALID_ID;
     }
     if (h_ai != PATCH_HOOK_INVALID_ID) {
         patchlib_uninstall_hook(h_ai);

@@ -74,6 +74,13 @@ typedef struct terraria_item_ops_t {
     bool(*can_use)(terraria_item_handle_t* current, patch_handle_t player_instance, patch_handle_t item_instance, bool ignore_cursed);
 
     /**
+     * @brief 物品被真正使用时回调（每次使用一次，不是每帧）
+     * @param player_instance 玩家实例（hook 期间有效）
+     * @param item_instance   物品实例（hook 期间有效）
+     */
+    void(*use)(terraria_item_handle_t* current, patch_handle_t player_instance, patch_handle_t item_instance);
+
+    /**
      * @brief 获取纹理实例(Asset<Texture2d>)
      * @param current 当前物品句柄
      * @return Asset<Texture2d>
