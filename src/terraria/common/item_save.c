@@ -26,19 +26,25 @@
  * 所以背包里的 Mod 物品退出重进就没了。这里把自定义物品按稳定字符串键
  * (loader/mod/name) 另存到“伴生文件”，读档后按槽位塞回去；数字 ID 变化也不影响。
  *
- * 自定义 Buff 也写进玩家伴生文件：原版存档按数字 ID 存 buff，卸载 Mod 后
- * 残留的 401+ ID 会让 Main.buffNoSave[id] 越界；所以自定义 Buff 一律
- * Main.buffNoSave = true（原版不存），改由这里按稳定字符串键存读。
+ * 自定义 Buff 也写进玩家伴生文件：自定义 Buff 由内核自管理，runtime_id 不会
+ * 写进 player.buffType（原版存档与绘制路径只会看到 0..BuffID.Count-1，因此
+ * Main.buffNoSave / Player.buffImmune / TextureAssets.Buff / Lang 缓存等按
+ * buff id 定长的原版数组不需要、也不应该为自定义 Buff 扩容），所以这里按稳定
+ * 字符串键 (loader/mod/name) 存读；卸载 Mod 后存档里不会残留无效 ID。
  *
  * 文件位置与命名：
  *   - 玩家：<xxx.plr>.tef  （与玩家存档同目录，随其一起备份/迁移）
  *   - 世界：<xxx.wld>.tef  （覆盖世界内所有箱子 Chest.item）
+ * 存档格式：v2 二进制（magic = "TEFSAVE2"，带 CRC32 校验）；
+ *           检测到旧版 v1 纯文本存档会直接删除，下次保存写入 v2。
  * 写入采用 先写 <path>.tmp 再 rename 的原子替换，避免写坏。
  *******************************************************************************/
 
 #include "internal/terraria/item_save.h"
 
+#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "internal/log.h"
@@ -49,8 +55,205 @@
 #include "patchlib/struct/array.h"
 #include "patchlib/struct/string.h"
 
-// 伴生文件头（读取时跳过以 '#' 开头的行）
-static const char *TEF_HEADER = "#tefkernel-item v1";
+/* ------------------------------------------------------------------
+ * 伴生存档 v2（二进制）
+ *
+ * v1 是纯文本 TSV：用户随手就能改，字符串重复、解析也慢。
+ * v2 结构（所有整数小端）：
+ *   magic[8]  "TEFSAVE2"
+ *   u32 version (2)
+ *   u32 kind    (1 = 玩家，2 = 世界)
+ *   u32 item_count
+ *   item:
+ *     kind == 玩家: string tag
+ *     kind == 世界: u32 chest
+ *     u32 slot
+ *     string loader / string mod / string name
+ *     u32 stack / u32 prefix
+ *   u32 buff_count（世界文件恒为 0）
+ *   buff:
+ *     string loader / string mod / string name / u32 time
+ *   u32 crc32（覆盖前面全部字节）
+ *
+ * 读取时兼容 v1 文本；写入一律 v2。
+ * crc 只能挡“随手改”，不是加密，挡不住有意的逆向。
+ * ------------------------------------------------------------------ */
+#define TEF_SAVE_MAGIC "TEFSAVE2"
+#define TEF_SAVE_MAGIC_LEN 8
+#define TEF_SAVE_VERSION 2u
+#define TEF_SAVE_KIND_PLAYER 1u
+#define TEF_SAVE_KIND_WORLD 2u
+
+typedef struct {
+  unsigned char *data;
+  size_t len;
+  size_t cap;
+  bool ok;
+} tef_buf_t;
+
+static bool tef_buf_raw(tef_buf_t *b, const void *p, const size_t n) {
+  if (!b->ok)
+    return false;
+  if (n == 0)
+    return true;
+  if (b->len + n > b->cap) {
+    size_t cap = b->cap ? b->cap : 256;
+    while (cap < b->len + n)
+      cap *= 2;
+    unsigned char *grown = (unsigned char *) realloc(b->data, cap);
+    if (!grown) {
+      b->ok = false;
+      return false;
+    }
+    b->data = grown;
+    b->cap = cap;
+  }
+  memcpy(b->data + b->len, p, n);
+  b->len += n;
+  return true;
+}
+
+static bool tef_buf_u32(tef_buf_t *b, const uint32_t v) {
+  unsigned char tmp[4];
+  tmp[0] = (unsigned char) (v & 0xFF);
+  tmp[1] = (unsigned char) ((v >> 8) & 0xFF);
+  tmp[2] = (unsigned char) ((v >> 16) & 0xFF);
+  tmp[3] = (unsigned char) ((v >> 24) & 0xFF);
+  return tef_buf_raw(b, tmp, sizeof(tmp));
+}
+
+static bool tef_buf_u16(tef_buf_t *b, const uint16_t v) {
+  unsigned char tmp[2];
+  tmp[0] = (unsigned char) (v & 0xFF);
+  tmp[1] = (unsigned char) ((v >> 8) & 0xFF);
+  return tef_buf_raw(b, tmp, sizeof(tmp));
+}
+
+static bool tef_buf_str(tef_buf_t *b, const char *s) {
+  size_t n = s ? strlen(s) : 0;
+  if (n > 0xFFFF)
+    n = 0xFFFF;
+  return tef_buf_u16(b, (uint16_t) n) && tef_buf_raw(b, s, n);
+}
+
+static void tef_buf_patch_u32(tef_buf_t *b, const size_t off,
+                              const uint32_t v) {
+  if (!b->ok || off + 4 > b->len)
+    return;
+  b->data[off + 0] = (unsigned char) (v & 0xFF);
+  b->data[off + 1] = (unsigned char) ((v >> 8) & 0xFF);
+  b->data[off + 2] = (unsigned char) ((v >> 16) & 0xFF);
+  b->data[off + 3] = (unsigned char) ((v >> 24) & 0xFF);
+}
+
+static uint32_t tef_crc32(const unsigned char *p, const size_t n) {
+  uint32_t crc = 0xFFFFFFFFu;
+  for (size_t i = 0; i < n; ++i) {
+    crc ^= p[i];
+    for (int k = 0; k < 8; ++k)
+      crc = (crc >> 1) ^ (0xEDB88320u & (uint32_t) -(int32_t) (crc & 1u));
+  }
+  return ~crc;
+}
+
+typedef struct {
+  const unsigned char *p;
+  size_t len;
+  size_t off;
+} tef_rd_t;
+
+static bool tef_rd_raw(tef_rd_t *r, void *out, const size_t n) {
+  if (r->off + n > r->len)
+    return false;
+  if (out)
+    memcpy(out, r->p + r->off, n);
+  r->off += n;
+  return true;
+}
+
+static bool tef_rd_u32(tef_rd_t *r, uint32_t *out) {
+  unsigned char tmp[4];
+  if (!tef_rd_raw(r, tmp, sizeof(tmp)))
+    return false;
+  *out = (uint32_t) tmp[0] | ((uint32_t) tmp[1] << 8) |
+         ((uint32_t) tmp[2] << 16) | ((uint32_t) tmp[3] << 24);
+  return true;
+}
+
+static bool tef_rd_u16(tef_rd_t *r, uint16_t *out) {
+  unsigned char tmp[2];
+  if (!tef_rd_raw(r, tmp, sizeof(tmp)))
+    return false;
+  *out = (uint16_t) ((uint16_t) tmp[0] | ((uint16_t) tmp[1] << 8));
+  return true;
+}
+
+static bool tef_rd_str(tef_rd_t *r, char *out, const size_t cap) {
+  uint16_t n = 0;
+  if (!tef_rd_u16(r, &n))
+    return false;
+  if (r->off + n > r->len)
+    return false;
+  const size_t copy = (cap > 0 && n >= cap) ? cap - 1 : n;
+  if (copy > 0)
+    memcpy(out, r->p + r->off, copy);
+  out[copy] = '\0';
+  r->off += n;
+  return true;
+}
+
+static unsigned char *tef_read_all(const char *path, size_t *out_len) {
+  *out_len = 0;
+  FILE *f = fopen(path, "rb");
+  if (!f)
+    return NULL;
+  if (fseek(f, 0, SEEK_END) != 0) {
+    fclose(f);
+    return NULL;
+  }
+  const long size = ftell(f);
+  if (size < 0) {
+    fclose(f);
+    return NULL;
+  }
+  rewind(f);
+  unsigned char *data = (unsigned char *) malloc((size_t) size + 1);
+  if (!data) {
+    fclose(f);
+    return NULL;
+  }
+  const size_t got = fread(data, 1, (size_t) size, f);
+  fclose(f);
+  data[got] = '\0';
+  *out_len = got;
+  return data;
+}
+
+static bool tef_write_all(const char *final_path, const void *data,
+                          const size_t len) {
+  char tmp_path[1400];
+  if (snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", final_path) >=
+      (int) sizeof(tmp_path))
+    return false;
+  FILE *f = fopen(tmp_path, "wb");
+  if (!f) {
+    TEKLOG_WARN("item_save: cannot write %s", tmp_path);
+    return false;
+  }
+  const bool ok = fwrite(data, 1, len, f) == len;
+  if (fclose(f) != 0 || !ok) {
+    remove(tmp_path);
+    TEKLOG_WARN("item_save: write %s failed", tmp_path);
+    return false;
+  }
+  remove(final_path);
+  if (rename(tmp_path, final_path) != 0) {
+    TEKLOG_WARN("item_save: rename '%s' -> '%s' failed", tmp_path, final_path);
+    remove(tmp_path);
+    return false;
+  }
+  return true;
+}
 
 // ---- 自定义物品存档所需句柄 ----
 static terraria_item_handles_t g_ops = {0};               // Item 字段/方法（来自 item_manager）
@@ -100,20 +303,6 @@ static bool make_tef_path(const char *base, char *buf, const size_t n) {
   if (snprintf(buf, n, "%s.tef", base) >= (int)n)
     return false;
   return true;
-}
-
-static FILE *tef_open_tmp(const char *final_path, char *tmp_path, const size_t n) {
-  if (snprintf(tmp_path, n, "%s.tmp", final_path) >= (int)n)
-    return NULL;
-  return fopen(tmp_path, "w");
-}
-
-static void tef_commit(FILE *f, const char *tmp_path, const char *final_path) {
-  if (f)
-    fclose(f);
-  remove(final_path); // Windows 上 rename 不能覆盖已存在文件
-  if (rename(tmp_path, final_path) != 0)
-    TEKLOG_WARN("item_save: rename '%s' -> '%s' failed", tmp_path, final_path);
 }
 
 // ------------------------------------------------------------------
@@ -247,19 +436,115 @@ static void container_set_custom(patch_handle_t arr, size_t slot, bool is_chest,
   }
 }
 
-// 当某个槽位里的物品是“自定义物品”时，把它的稳定键写出一行；返回是否写出。
-static bool write_custom_item_line(FILE *f, const size_t a, const size_t b,
-                                   patch_handle_t item) {
+/* 把箱子里“超出当前已注册自定义范围”的物品换成内核占位物品。
+ * 这些物品通常来自已卸载的 Mod（或 .tef 伴生文件缺失/滞后）。
+ * 不清理的话，UI / 绘制按 type 索引原版数组会越界，表现为箱子打不开。 */
+static int sanitize_chest(patch_handle_t chest, const int max_valid) {
+  if (!patchlib_is_valid(chest) || !patchlib_is_valid(f_chest_item) ||
+      !patchlib_is_valid(g_ops.f_type))
+    return 0;
+
+  terraria_item_handle_t *placeholder = terraria_item_manager_unknown_item();
+  const int placeholder_id = placeholder ? placeholder->runtime_id : -1;
+  if (placeholder_id < 0)
+    return 0;
+
+  int max_items = 0;
+  if (patchlib_is_valid(f_chest_max_items))
+    patchlib_field_get_value(f_chest_max_items, chest, &max_items);
+
+  patch_handle_t items = PATCH_NULL;
+  patchlib_field_get_value(f_chest_item, chest, &items);
+  if (!patchlib_is_valid(items))
+    return 0;
+
+  size_t lim = patchlib_array_length(items);
+  if (max_items > 0 && (size_t)max_items < lim)
+    lim = (size_t)max_items;
+
+  int changed = 0;
+  for (size_t si = 0; si < lim; ++si) {
+    patch_handle_t item = container_get_item(items, si, true);
+    if (!patchlib_is_valid(item))
+      continue;
+
+    int type = 0;
+    patchlib_field_get_value(g_ops.f_type, item, &type);
+    if (type >= max_valid) {
+      container_set_custom(items, si, true, placeholder_id, 1, 0);
+      changed++;
+    }
+    patchlib_free(item);
+  }
+
+  patchlib_free(items);
+  return changed;
+}
+
+static void sanitize_world_chests(void) {
+  if (!patchlib_is_valid(f_main_chest))
+    return;
+
+  patch_handle_t chests = PATCH_NULL;
+  patchlib_field_get_value(f_main_chest, PATCH_NULL, &chests);
+  if (!patchlib_is_valid(chests))
+    return;
+
+  const int max_valid = terraria_item_manager_get_count();
+  int changed = 0;
+  const size_t count = patchlib_array_length(chests);
+  for (size_t i = 0; i < count; ++i) {
+    patch_handle_t chest = PATCH_NULL;
+    if (!patchlib_array_at(chests, i, &chest) || !patchlib_is_valid(chest))
+      continue;
+    changed += sanitize_chest(chest, max_valid);
+    patchlib_free(chest);
+  }
+  patchlib_free(chests);
+
+  if (changed > 0)
+    TEKLOG_INFO("item_save: replaced %d stale custom item(s) in world chests",
+                changed);
+}
+
+static void sanitize_player_banks(patch_handle_t player) {
+  if (!patchlib_is_valid(player))
+    return;
+
+  patch_handle_t banks[4] = {f_player_bank, f_player_bank2, f_player_bank3,
+                             f_player_bank4};
+  const int max_valid = terraria_item_manager_get_count();
+  int changed = 0;
+  for (int i = 0; i < 4; ++i) {
+    if (!patchlib_is_valid(banks[i]))
+      continue;
+    patch_handle_t chest = PATCH_NULL;
+    patchlib_field_get_value(banks[i], player, &chest);
+    if (!patchlib_is_valid(chest))
+      continue;
+    changed += sanitize_chest(chest, max_valid);
+    patchlib_free(chest);
+  }
+
+  if (changed > 0)
+    TEKLOG_INFO("item_save: replaced %d stale custom item(s) in banks", changed);
+}
+
+/* 把某个槽位的自定义物品追加成一条二进制记录；返回是否写出。 */
+static bool append_item_record(tef_buf_t *b, const bool world, const char *tag,
+                               const size_t a, const size_t slot,
+                               patch_handle_t item) {
   const int base = terraria_item_id_get_count();
   const size_t custom = tefstd_vector_size(&g_terraria_item_registry);
 
   int type = 0;
   patchlib_field_get_value(g_ops.f_type, item, &type);
   const int nid = type - base;
-  if (nid < 0 || nid >= (int)custom)
+  if (nid < 0 || nid >= (int) custom)
     return false;
 
-  terraria_item_handle_t **pp = tefstd_vector_at(&g_terraria_item_registry, nid);
+  terraria_item_handle_t **pp =
+      tefstd_vector_at(&g_terraria_item_registry, nid);
   if (!pp || !*pp)
     return false;
 
@@ -272,16 +557,25 @@ static bool write_custom_item_line(FILE *f, const size_t a, const size_t b,
   if (patchlib_is_valid(g_ops.f_item_prefix))
     patchlib_field_get_value(g_ops.f_item_prefix, item, &prefix);
 
-  fprintf(f, "%zu\t%zu\t%s\t%s\t%s\t%d\t%d\n", a, b,
-          (*pp)->parent_modloader_id ? (*pp)->parent_modloader_id : "?",
-          (*pp)->parent_id ? (*pp)->parent_id : "?",
-          (*pp)->internal_name ? (*pp)->internal_name : "?", stack,
-          (int)prefix);
-  return true;
+  const char *loader =
+      (*pp)->parent_modloader_id ? (*pp)->parent_modloader_id : "?";
+  const char *mod = (*pp)->parent_id ? (*pp)->parent_id : "?";
+  const char *name = (*pp)->internal_name ? (*pp)->internal_name : "?";
+
+  if (world) {
+    if (!tef_buf_u32(b, (uint32_t) a))
+      return false;
+  } else {
+    if (!tef_buf_str(b, tag))
+      return false;
+  }
+  return tef_buf_u32(b, (uint32_t) slot) && tef_buf_str(b, loader) &&
+         tef_buf_str(b, mod) && tef_buf_str(b, name) &&
+         tef_buf_u32(b, (uint32_t) stack) && tef_buf_u32(b, (uint32_t) prefix);
 }
 
-// 把玩家某个容器里的自定义物品写进文件，返回写入条数
-static int save_one_container(FILE *f, const char *tag, patch_handle_t arr,
+// 把玩家某个容器里的自定义物品写进二进制缓冲，返回写入条数
+static int save_one_container(tef_buf_t *b, const char *tag, patch_handle_t arr,
                               bool is_chest) {
   if (!patchlib_is_valid(arr))
     return 0;
@@ -293,37 +587,9 @@ static int save_one_container(FILE *f, const char *tag, patch_handle_t arr,
     patch_handle_t item = container_get_item(arr, i, is_chest);
     if (!patchlib_is_valid(item))
       continue;
-
-    // 行格式：tag slot loader mod name stack prefix
-    // 先借用一个临时缓冲判断是否是自定义物品，再按带 tag 的格式输出。
-    const int base = terraria_item_id_get_count();
-    const size_t custom = tefstd_vector_size(&g_terraria_item_registry);
-    int type = 0;
-    patchlib_field_get_value(g_ops.f_type, item, &type);
-    const int nid = type - base;
-    if (nid < 0 || nid >= (int)custom)
-      continue;
-
-    terraria_item_handle_t **pp =
-        tefstd_vector_at(&g_terraria_item_registry, nid);
-    if (!pp || !*pp)
-      continue;
-
-    int stack = 0;
-    patchlib_field_get_value(g_ops.f_stack, item, &stack);
-    if (stack <= 0)
-      continue;
-
-    unsigned char prefix = 0;
-    if (patchlib_is_valid(g_ops.f_item_prefix))
-      patchlib_field_get_value(g_ops.f_item_prefix, item, &prefix);
-
-    fprintf(f, "%s\t%zu\t%s\t%s\t%s\t%d\t%d\n", tag, i,
-            (*pp)->parent_modloader_id ? (*pp)->parent_modloader_id : "?",
-            (*pp)->parent_id ? (*pp)->parent_id : "?",
-            (*pp)->internal_name ? (*pp)->internal_name : "?", stack,
-            (int)prefix);
-    saved++;
+    if (append_item_record(b, false, tag, 0, i, item))
+      saved++;
+    patchlib_free(item);
   }
   return saved;
 }
@@ -333,18 +599,21 @@ static int save_one_container(FILE *f, const char *tag, patch_handle_t arr,
 // ------------------------------------------------------------------
 
 struct buff_save_ctx {
-  FILE *f;
+  tef_buf_t *b;
   int count;
 };
 
 static void save_buff_line(void *user, terraria_buff_handle_t *buff, int time) {
   struct buff_save_ctx *ctx = (struct buff_save_ctx *) user;
-  if (!ctx || !ctx->f || !buff || time <= 0) return;
-  fprintf(ctx->f, "buff\t%s\t%s\t%s\t%d\n",
-          buff->parent_modloader_id ? buff->parent_modloader_id : "?",
-          buff->parent_id ? buff->parent_id : "?",
-          buff->internal_name ? buff->internal_name : "?", time);
-  ctx->count++;
+  if (!ctx || !ctx->b || !buff || time <= 0) return;
+  const char *loader =
+      buff->parent_modloader_id ? buff->parent_modloader_id : "?";
+  const char *mod = buff->parent_id ? buff->parent_id : "?";
+  const char *name = buff->internal_name ? buff->internal_name : "?";
+  if (tef_buf_str(ctx->b, loader) && tef_buf_str(ctx->b, mod) &&
+      tef_buf_str(ctx->b, name) &&
+      tef_buf_u32(ctx->b, (uint32_t) time))
+    ctx->count++;
 }
 
 static void save_player_items(patch_handle_t player, patch_handle_t pfd) {
@@ -361,14 +630,14 @@ static void save_player_items(patch_handle_t player, patch_handle_t pfd) {
   if (!make_tef_path(plr, final_path, sizeof(final_path)))
     return;
 
-  char tmp_path[1400];
-  FILE *f = tef_open_tmp(final_path, tmp_path, sizeof(tmp_path));
-  if (!f) {
-    TEKLOG_WARN("item_save: cannot write %s", final_path);
-    return;
-  }
+  tef_buf_t b = {0};
+  b.ok = true;
 
-  fprintf(f, "%s\n", TEF_HEADER);
+  tef_buf_raw(&b, TEF_SAVE_MAGIC, TEF_SAVE_MAGIC_LEN);
+  tef_buf_u32(&b, TEF_SAVE_VERSION);
+  tef_buf_u32(&b, TEF_SAVE_KIND_PLAYER);
+  const size_t item_count_pos = b.len;
+  tef_buf_u32(&b, 0);
 
   int saved = 0;
   for (size_t t = 0;
@@ -377,17 +646,55 @@ static void save_player_items(patch_handle_t player, patch_handle_t pfd) {
     patch_handle_t arr =
         resolve_container_array(g_container_tags[t], player, &is_chest);
     if (patchlib_is_valid(arr)) {
-      saved += save_one_container(f, g_container_tags[t], arr, is_chest);
+      saved += save_one_container(&b, g_container_tags[t], arr, is_chest);
       patchlib_free(arr);
     }
   }
+  tef_buf_patch_u32(&b, item_count_pos, (uint32_t) saved);
 
-  struct buff_save_ctx bctx = {f, 0};
+  const size_t buff_count_pos = b.len;
+  tef_buf_u32(&b, 0);
+  struct buff_save_ctx bctx = {&b, 0};
   terraria_buff_manager_visit_active(player, save_buff_line, &bctx);
+  tef_buf_patch_u32(&b, buff_count_pos, (uint32_t) bctx.count);
 
-  tef_commit(f, tmp_path, final_path);
-  TEKLOG_DEBUG("item_save: saved %d custom item(s), %d buff(s) to %s", saved,
-               bctx.count, final_path);
+  const uint32_t crc = b.ok ? tef_crc32(b.data, b.len) : 0;
+  tef_buf_u32(&b, crc);
+
+  if (b.ok && tef_write_all(final_path, b.data, b.len))
+    TEKLOG_DEBUG("item_save: saved %d item(s), %d buff(s) to %s", saved,
+                 bctx.count, final_path);
+  free(b.data);
+}
+
+/* 把一条玩家物品记录恢复到对应容器；未注册的 Mod 用 UNKNOWN 占位。 */
+static void apply_player_item(patch_handle_t player, const char *tag,
+                              const size_t slot, const char *loader,
+                              const char *mod, const char *item_name,
+                              const int stack, const int prefix) {
+  bool is_chest = false;
+  patch_handle_t arr = resolve_container_array(tag, player, &is_chest);
+  if (!patchlib_is_valid(arr))
+    return;
+
+  terraria_item_handle_t *h =
+      terraria_item_manager_find_item(loader, mod, item_name);
+  if (!h || h->runtime_id < 0) {
+    TEKLOG_WARN("item_save: mod item %s.%s.%s not found, using placeholder",
+                loader, mod, item_name);
+    h = terraria_item_manager_unknown_item();
+  }
+  if (!h || h->runtime_id < 0) {
+    patchlib_free(arr);
+    return;
+  }
+  if (slot >= patchlib_array_length(arr)) {
+    patchlib_free(arr);
+    return;
+  }
+
+  container_set_custom(arr, slot, is_chest, h->runtime_id, stack, prefix);
+  patchlib_free(arr);
 }
 
 static void load_player_items(patch_handle_t player, patch_handle_t pfd) {
@@ -402,74 +709,83 @@ static void load_player_items(patch_handle_t player, patch_handle_t pfd) {
   if (!make_tef_path(plr, final_path, sizeof(final_path)))
     return;
 
-  FILE *f = fopen(final_path, "r");
-  if (!f)
+  size_t len = 0;
+  unsigned char *data = tef_read_all(final_path, &len);
+  if (!data)
     return;
 
-  char line[700];
-  int restored = 0;
-  while (fgets(line, sizeof(line), f)) {
-    if (line[0] == '#')
-      continue;
-
-    if (strncmp(line, "buff\t", 5) == 0) {
-      char bloader[160] = {0}, bmod[160] = {0}, bname[160] = {0};
-      int btime = 0;
-      if (sscanf(line, "buff\t%159[^\t]\t%159[^\t]\t%159[^\t]\t%d",
-                 bloader, bmod, bname, &btime) == 4 && btime > 0) {
-        terraria_buff_handle_t *bh = terraria_buff_manager_find_buff(bloader, bmod, bname);
-        if (bh) {
-          terraria_buff_manager_add(bh, player, btime);
-          restored++;
-        } else {
-          TEKLOG_WARN("item_save: buff %s.%s.%s not found (mod unloaded?)",
-                      bloader, bmod, bname);
-        }
-      }
-      continue;
-    }
-
-    char tag[32] = {0};
-    size_t slot = 0;
-    char loader[160] = {0}, mod[160] = {0}, item_name[160] = {0};
-    int stack = 0, prefix = 0;
-    if (sscanf(line, "%31[^\t]\t%zu\t%159[^\t]\t%159[^\t]\t%159[^\t]\t%d\t%d",
-               tag, &slot, loader, mod, item_name, &stack, &prefix) != 7)
-      continue;
-
-    bool is_chest = false;
-    patch_handle_t arr = resolve_container_array(tag, player, &is_chest);
-    if (!patchlib_is_valid(arr))
-      continue;
-
-    terraria_item_handle_t *h =
-        terraria_item_manager_find_item(loader, mod, item_name);
-    if (!h || h->runtime_id < 0) {
-      // Mod 已被卸载：用内核预留的“未知物品”占位，保留槽位而不是直接丢掉
-      TEKLOG_WARN("item_save: mod item %s.%s.%s not found, using placeholder",
-                  loader, mod, item_name);
-      h = terraria_item_manager_unknown_item();
-    }
-    if (!h || h->runtime_id < 0) {
-      patchlib_free(arr);
-      continue;
-    }
-
-    // 槽位越界保护（存档被手动修改或容器长度变化时会越界）
-    if (slot >= patchlib_array_length(arr)) {
-      patchlib_free(arr);
-      continue;
-    }
-
-    // netDefaults/createItem 会触发 set_defaults_postfix，套用自定义默认值
-    container_set_custom(arr, slot, is_chest, h->runtime_id, stack, prefix);
-    restored++;
-    patchlib_free(arr);
+  if (len < 20 || memcmp(data, TEF_SAVE_MAGIC, TEF_SAVE_MAGIC_LEN) != 0) {
+    /* 旧版纯文本存档：不读取，直接删掉（下次保存会写 v2） */
+    TEKLOG_INFO("item_save: %s 是旧版文本存档，已删除", final_path);
+    free(data);
+    remove(final_path);
+    return;
   }
 
-  fclose(f);
-  TEKLOG_DEBUG("item_save: restored %d custom item(s) from %s", restored,
-               final_path);
+  const size_t body = len - 4;
+  const uint32_t stored =
+      (uint32_t) data[body] | ((uint32_t) data[body + 1] << 8) |
+      ((uint32_t) data[body + 2] << 16) | ((uint32_t) data[body + 3] << 24);
+  if (tef_crc32(data, body) != stored) {
+    TEKLOG_WARN("item_save: %s CRC 校验失败，已忽略", final_path);
+    free(data);
+    return;
+  }
+
+  tef_rd_t r = {data, body, TEF_SAVE_MAGIC_LEN};
+  uint32_t version = 0, kind = 0, item_count = 0, buff_count = 0;
+  if (!tef_rd_u32(&r, &version) || !tef_rd_u32(&r, &kind) ||
+      !tef_rd_u32(&r, &item_count) || version != TEF_SAVE_VERSION ||
+      kind != TEF_SAVE_KIND_PLAYER) {
+    TEKLOG_WARN("item_save: %s 头部无效，已忽略", final_path);
+    free(data);
+    return;
+  }
+
+  int restored = 0;
+  for (uint32_t i = 0; i < item_count; ++i) {
+    char tag[32] = {0};
+    char loader[160] = {0}, mod[160] = {0}, item_name[160] = {0};
+    uint32_t slot = 0, stack = 0, prefix = 0;
+    if (!tef_rd_str(&r, tag, sizeof(tag)) || !tef_rd_u32(&r, &slot) ||
+        !tef_rd_str(&r, loader, sizeof(loader)) ||
+        !tef_rd_str(&r, mod, sizeof(mod)) ||
+        !tef_rd_str(&r, item_name, sizeof(item_name)) ||
+        !tef_rd_u32(&r, &stack) || !tef_rd_u32(&r, &prefix))
+      break;
+    if (tag[0] && stack > 0) {
+      apply_player_item(player, tag, (size_t) slot, loader, mod, item_name,
+                        (int) stack, (int) prefix);
+      restored++;
+    }
+  }
+
+  if (!tef_rd_u32(&r, &buff_count))
+    buff_count = 0;
+  int buffs = 0;
+  for (uint32_t i = 0; i < buff_count; ++i) {
+    char loader[160] = {0}, mod[160] = {0}, name[160] = {0};
+    uint32_t time = 0;
+    if (!tef_rd_str(&r, loader, sizeof(loader)) ||
+        !tef_rd_str(&r, mod, sizeof(mod)) ||
+        !tef_rd_str(&r, name, sizeof(name)) || !tef_rd_u32(&r, &time))
+      break;
+    if (time == 0)
+      continue;
+    terraria_buff_handle_t *bh =
+        terraria_buff_manager_find_buff(loader, mod, name);
+    if (bh) {
+      terraria_buff_manager_add(bh, player, (int) time);
+      buffs++;
+    } else {
+      TEKLOG_WARN("item_save: buff %s.%s.%s not found (mod unloaded?)",
+                  loader, mod, name);
+    }
+  }
+
+  free(data);
+  TEKLOG_DEBUG("item_save: restored %d item(s), %d buff(s) from %s", restored,
+               buffs, final_path);
 }
 
 static void player_save_postfix(patch_handle_t this, void **args, void *result,
@@ -500,6 +816,7 @@ static void player_load_postfix(patch_handle_t this, void **args, void *result,
   patch_handle_t player = PATCH_NULL;
   patchlib_method_invoke_args(m_pfd_get_player, pfd, &player, NULL);
   load_player_items(player, pfd);
+  sanitize_player_banks(player);
 }
 
 // ------------------------------------------------------------------
@@ -532,14 +849,14 @@ static void save_world_chests() {
   if (!make_tef_path(wld, final_path, sizeof(final_path)))
     return;
 
-  char tmp_path[1400];
-  FILE *f = tef_open_tmp(final_path, tmp_path, sizeof(tmp_path));
-  if (!f) {
-    TEKLOG_WARN("item_save: cannot write %s", final_path);
-    return;
-  }
+  tef_buf_t b = {0};
+  b.ok = true;
 
-  fprintf(f, "%s\n", TEF_HEADER);
+  tef_buf_raw(&b, TEF_SAVE_MAGIC, TEF_SAVE_MAGIC_LEN);
+  tef_buf_u32(&b, TEF_SAVE_VERSION);
+  tef_buf_u32(&b, TEF_SAVE_KIND_WORLD);
+  const size_t item_count_pos = b.len;
+  tef_buf_u32(&b, 0);
 
   int saved = 0;
   patch_handle_t chests = PATCH_NULL;
@@ -559,14 +876,15 @@ static void save_world_chests() {
       patchlib_field_get_value(f_chest_item, chest, &items);
       if (patchlib_is_valid(items)) {
         size_t lim = patchlib_array_length(items);
-        if (max_items > 0 && (size_t)max_items < lim)
-          lim = (size_t)max_items;
+        if (max_items > 0 && (size_t) max_items < lim)
+          lim = (size_t) max_items;
         for (size_t si = 0; si < lim; ++si) {
           patch_handle_t item = container_get_item(items, si, true);
           if (!patchlib_is_valid(item))
             continue;
-          if (write_custom_item_line(f, ci, si, item))
+          if (append_item_record(&b, true, NULL, ci, si, item))
             saved++;
+          patchlib_free(item);
         }
         patchlib_free(items);
       }
@@ -574,10 +892,57 @@ static void save_world_chests() {
     }
     patchlib_free(chests);
   }
+  tef_buf_patch_u32(&b, item_count_pos, (uint32_t) saved);
 
-  tef_commit(f, tmp_path, final_path);
-  TEKLOG_DEBUG("item_save: saved %d custom item(s) in world chests to %s", saved,
-               final_path);
+  /* 世界文件没有 buff 段，但保留计数字段让格式一致 */
+  tef_buf_u32(&b, 0);
+
+  const uint32_t crc = b.ok ? tef_crc32(b.data, b.len) : 0;
+  tef_buf_u32(&b, crc);
+
+  if (b.ok && tef_write_all(final_path, b.data, b.len))
+    TEKLOG_DEBUG("item_save: saved %d item(s) in world chests to %s", saved,
+                 final_path);
+  free(b.data);
+}
+
+/* 把一条箱子物品记录恢复到 Main.chest；未注册的 Mod 用 UNKNOWN 占位。 */
+static void apply_world_item(patch_handle_t chests, const size_t chest_idx,
+                             const size_t slot, const char *loader,
+                             const char *mod, const char *item_name,
+                             const int stack, const int prefix) {
+  if (chest_idx >= patchlib_array_length(chests))
+    return;
+
+  patch_handle_t chest = PATCH_NULL;
+  if (!patchlib_array_at(chests, chest_idx, &chest) || !patchlib_is_valid(chest))
+    return;
+
+  patch_handle_t items = PATCH_NULL;
+  patchlib_field_get_value(f_chest_item, chest, &items);
+  if (!patchlib_is_valid(items) || slot >= patchlib_array_length(items)) {
+    if (patchlib_is_valid(items))
+      patchlib_free(items);
+    patchlib_free(chest);
+    return;
+  }
+
+  terraria_item_handle_t *h =
+      terraria_item_manager_find_item(loader, mod, item_name);
+  if (!h || h->runtime_id < 0) {
+    TEKLOG_WARN("item_save: chest mod item %s.%s.%s not found, using placeholder",
+                loader, mod, item_name);
+    h = terraria_item_manager_unknown_item();
+  }
+  if (!h || h->runtime_id < 0) {
+    patchlib_free(items);
+    patchlib_free(chest);
+    return;
+  }
+
+  container_set_custom(items, slot, true, h->runtime_id, stack, prefix);
+  patchlib_free(items);
+  patchlib_free(chest);
 }
 
 static void load_world_chests() {
@@ -592,68 +957,65 @@ static void load_world_chests() {
   if (!make_tef_path(wld, final_path, sizeof(final_path)))
     return;
 
-  FILE *f = fopen(final_path, "r");
-  if (!f)
+  size_t len = 0;
+  unsigned char *data = tef_read_all(final_path, &len);
+  if (!data)
     return;
+
+  if (len < 20 || memcmp(data, TEF_SAVE_MAGIC, TEF_SAVE_MAGIC_LEN) != 0) {
+    TEKLOG_INFO("item_save: %s 是旧版文本存档，已删除", final_path);
+    free(data);
+    remove(final_path);
+    return;
+  }
+
+  const size_t body = len - 4;
+  const uint32_t stored =
+      (uint32_t) data[body] | ((uint32_t) data[body + 1] << 8) |
+      ((uint32_t) data[body + 2] << 16) | ((uint32_t) data[body + 3] << 24);
+  if (tef_crc32(data, body) != stored) {
+    TEKLOG_WARN("item_save: %s CRC 校验失败，已忽略", final_path);
+    free(data);
+    return;
+  }
+
+  tef_rd_t r = {data, body, TEF_SAVE_MAGIC_LEN};
+  uint32_t version = 0, kind = 0, item_count = 0;
+  if (!tef_rd_u32(&r, &version) || !tef_rd_u32(&r, &kind) ||
+      !tef_rd_u32(&r, &item_count) || version != TEF_SAVE_VERSION ||
+      kind != TEF_SAVE_KIND_WORLD) {
+    TEKLOG_WARN("item_save: %s 头部无效，已忽略", final_path);
+    free(data);
+    return;
+  }
 
   patch_handle_t chests = PATCH_NULL;
   patchlib_field_get_value(f_main_chest, PATCH_NULL, &chests);
   if (!patchlib_is_valid(chests)) {
-    fclose(f);
+    free(data);
     return;
   }
 
-  char line[700];
   int restored = 0;
-  while (fgets(line, sizeof(line), f)) {
-    if (line[0] == '#')
-      continue;
-
-    size_t chest_idx = 0, slot = 0;
+  for (uint32_t i = 0; i < item_count; ++i) {
     char loader[160] = {0}, mod[160] = {0}, item_name[160] = {0};
-    int stack = 0, prefix = 0;
-    if (sscanf(line, "%zu\t%zu\t%159[^\t]\t%159[^\t]\t%159[^\t]\t%d\t%d",
-               &chest_idx, &slot, loader, mod, item_name, &stack, &prefix) != 7)
+    uint32_t chest_idx = 0, slot = 0, stack = 0, prefix = 0;
+    if (!tef_rd_u32(&r, &chest_idx) || !tef_rd_u32(&r, &slot) ||
+        !tef_rd_str(&r, loader, sizeof(loader)) ||
+        !tef_rd_str(&r, mod, sizeof(mod)) ||
+        !tef_rd_str(&r, item_name, sizeof(item_name)) ||
+        !tef_rd_u32(&r, &stack) || !tef_rd_u32(&r, &prefix))
+      break;
+    if (stack == 0)
       continue;
-
-    if (chest_idx >= patchlib_array_length(chests))
-      continue;
-
-    patch_handle_t chest = PATCH_NULL;
-    if (!patchlib_array_at(chests, chest_idx, &chest) || !patchlib_is_valid(chest))
-      continue;
-
-    patch_handle_t items = PATCH_NULL;
-    patchlib_field_get_value(f_chest_item, chest, &items);
-    if (!patchlib_is_valid(items) || slot >= patchlib_array_length(items)) {
-      if (patchlib_is_valid(items)) patchlib_free(items);
-      patchlib_free(chest);
-      continue;
-    }
-
-    terraria_item_handle_t *h =
-        terraria_item_manager_find_item(loader, mod, item_name);
-    if (!h || h->runtime_id < 0) {
-      TEKLOG_WARN("item_save: chest mod item %s.%s.%s not found, using placeholder",
-                  loader, mod, item_name);
-      h = terraria_item_manager_unknown_item();
-    }
-    if (!h || h->runtime_id < 0) {
-      patchlib_free(items);
-      patchlib_free(chest);
-      continue;
-    }
-
-    container_set_custom(items, slot, true, h->runtime_id, stack, prefix);
+    apply_world_item(chests, (size_t) chest_idx, (size_t) slot, loader, mod,
+                     item_name, (int) stack, (int) prefix);
     restored++;
-
-    patchlib_free(items);
-    patchlib_free(chest);
   }
 
   patchlib_free(chests);
-  fclose(f);
-  TEKLOG_DEBUG("item_save: restored %d custom item(s) in world chests from %s",
+  free(data);
+  TEKLOG_DEBUG("item_save: restored %d item(s) in world chests from %s",
                restored, final_path);
 }
 
@@ -673,6 +1035,7 @@ static void chest_load_postfix(patch_handle_t this, void **args, void *result,
   (void)result;
   (void)sig;
   load_world_chests();
+  sanitize_world_chests();
 }
 
 // ------------------------------------------------------------------

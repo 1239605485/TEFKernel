@@ -13,6 +13,11 @@
  *   · 内核自己维护「玩家 -> 活跃 buff -> 剩余帧数」，每帧推进并回调 update；
  *   · 图标与倒计时由内核 GUI 覆盖层绘制；
  *   · 不扩容任何原版数组，不挂钩 AddBuff / FindBuffIndex / DelBuff。
+ *     原版按 buff id 索引、长度 BuffID.Count 的数组（Main.buffNoSave /
+ *     buffNoTimeDisplay / pvpBuff / lightPet / vanityPet / debuff、
+ *     Player/NPC.buffImmune、TextureAssets.Buff、Lang._buffNameCache /
+ *     _buffDescriptionCache、BuffID.Sets.*）只会收到原版 0..Count-1 的 id；
+ *     自定义 buff 从不进入这些索引，因此无需扩容。
  *******************************************************************************/
 
 #include "internal/terraria/buff_manager.h"
@@ -377,6 +382,8 @@ static void player_tick(patch_handle_t this) {
             g_active_count--;
             continue;
         }
+        /* i 是内核 g_active[] 的下标，不是 player.buffType[] 的槽位。
+         * 模组不得拿它（或 runtime_id）去索引原版按 buff 槽位/id 定长的数组。 */
         if (h->buff_ops.update)
             h->buff_ops.update(h, this, i);
         i++;
