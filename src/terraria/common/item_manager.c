@@ -204,6 +204,21 @@ static patch_handle_t f_item_name_cache = PATCH_NULL;
 static patch_handle_t f_item_tooltip_cache = PATCH_NULL;
 static patch_handle_t f_item_sorting_whitelists = PATCH_NULL; // ItemSorting._layerWhiteLists
 
+/* 实例级/懒加载的「按物品 type 索引」数组。
+ * 这些字段句柄长期缓存，所属 class 句柄绝对不能提前释放（桌面 Mono 上
+ * field 句柄依附 class 弱句柄，见 resolve_prefix_sets 的说明），故一并常驻。 */
+static patch_handle_t g_emergency_stacking_class = PATCH_NULL;
+static patch_handle_t f_emergency_group_lookup = PATCH_NULL;  // EmergencyStacking._groupLookup
+static patch_handle_t f_emergency_group_default = PATCH_NULL; // EmergencyStacking+Group.Default
+static bool g_emergency_group_lookup_checked = false;
+
+static patch_handle_t g_misc_fallback_class = PATCH_NULL;
+static patch_handle_t f_misc_fallback_fits = PATCH_NULL; // ItemFilters+MiscFallback._fitsFilterByItemType
+
+static patch_handle_t g_loot_counter_class = PATCH_NULL;
+static patch_handle_t f_loot_counter_counts = PATCH_NULL;        // _itemCountsObtained
+static patch_handle_t f_loot_counter_counts_expert = PATCH_NULL; // _itemCountsObtainedExpert
+
 static patch_handle_t m_from_language_key = PATCH_NULL; // static ItemTooltip FromLanguageKey(short id, string key)
 
 // 自定义物品通用字段/方法句柄（通过 terraria_item_manager_get_item_ops 提供给存档等模块）
@@ -1044,6 +1059,8 @@ static void resize_array(const char *ns, const char *cls, const char *fid,
                          patch_handle_t type, int nsize, void *dvalue,
                          const bool allow_create);
 
+static void install_instance_item_array_hooks(void);
+
 #if !__ANDROID__
 // PC端：AssetInitializer.LoadTextures 会按 TextureAssets.Item 的新长度遍历，
 // 并读取 ItemID.Sets.TextureCopyLoad[i]（原版长度只有 ItemID.Count），
@@ -1167,6 +1184,17 @@ static void resize_all_class_sets(const char *ns, const char *cls,
 
         // List<T> 类型
         "ItemsThatAreProcessedAfterNormalContentSample", "NonColorfulDyeItems",
+
+        // Dictionary<int, Dictionary<int, int>>（AmmoID.Sets）：不是数组，
+        // 也不按物品 type 索引（键是弹药 type，值是发射器 -> 弹幕的映射）。
+        // 若被当成数组做 array_length/array_resize，移动端会按对象内存布局
+        // 读出一个假的 "长度"，最坏情况把字典字段替换成数组。
+        "SpecificLauncherAmmoProjectileMatches",
+
+        // 按「染料 shader id」索引，不是物品 type：
+        // DyeInitializer.Load 把它重建为 new bool[shaderId+1]，
+        // Player.IsColorfulDye(int dye) 传入的是 Player.dye 槽里的 shader id。
+        "ColorfulDyeValues",
 
         // 长度不等于 ItemID.Count 的数组
         "ItemsForStuffCannon", "Workbenches"
@@ -1712,6 +1740,10 @@ void terraria_item_manager_init() {
         patchlib_free(item_sorting_cls);
     }
 
+    /* 实例级/懒加载的按物品 type 索引数组（紧急堆叠分类、创意菜单杂项
+     * 过滤缓存、掉落模拟计数器）：在对象构造/getter 返回后自愈扩容。 */
+    install_instance_item_array_hooks();
+
     patch_handle_t item_tooltip_cls = patchlib_type_get_type("Terraria.UI", "ItemTooltip");
     // 两端签名不同：
     //   桌面  FromLanguageKey(string key)              → 1 参
@@ -2246,8 +2278,261 @@ static void resize_quickstacking(const int new_size) {
     patchlib_free(qs_class);
 }
 
+// ============================================================================
+// 实例级「按物品 type 索引」数组的构造后自愈
+//
+// 有两类原版数组不是静态字段，无法在 terraria_item_manager_resize 里统一扩：
+//   1) EmergencyStacking._groupLookup：懒加载（第一次需要紧急堆叠时才建表），
+//      长度为 ItemID.Count，用 GroupLookup[stackableItem.type] 取值；
+//   2) 每次 new 出来的对象里的实例数组（创意菜单过滤器、掉落模拟计数器）。
+// 前者的正确时机是 getter 返回后，后者的正确时机是构造函数返回后，
+// 因此统一用 postfix 钩子做「不够长就补长」，可重复调用、幂等。
+// ============================================================================
+
+/* 把实例字段上的数组扩到 new_size（新槽保持元素默认值）。返回是否扩过。 */
+static bool grow_instance_array_field(patch_handle_t field,
+                                      patch_handle_t instance, const int new_size,
+                                      const char *label) {
+    if (!patchlib_is_valid(field) || new_size <= 0)
+        return false;
+
+    patch_handle_t array = PATCH_NULL;
+    patchlib_field_get_value(field, instance, &array);
+    if (!patchlib_is_valid(array))
+        return false;
+
+    const size_t len = patchlib_array_length(array);
+    if (len >= (size_t) new_size) {
+        patchlib_free(array);
+        return false;
+    }
+
+    bool ok = false;
+    patch_handle_t bigger = patchlib_array_resize(array, (size_t) new_size, NULL);
+    if (patchlib_is_valid(bigger)) {
+        patchlib_field_set_value(field, instance, &bigger);
+        TEKLOG_INFO("%s: %zu -> %d", label, len, new_size);
+        patchlib_free(bigger);
+        ok = true;
+    } else {
+        TEKLOG_WARN("%s: grow failed (len=%zu need=%d)", label, len, new_size);
+    }
+    patchlib_free(array);
+    return ok;
+}
+
+/* EmergencyStacking.GroupLookup postfix：
+ *   Group obj = GroupLookup[stackableItem.type];   (EmergencyStacking.cs:340)
+ * 原版只建 ItemID.Count 项，自定义物品取分类时越界。
+ * 新槽位统一填 EmergencyStacking.Group.Default（Contains 恒为 true，
+ * DistanceStepSize/StackingPriority 都已由 getter 初始化）。 */
+static void emergency_stacking_group_lookup_postfix(
+        patch_handle_t this, void **args, void *result,
+        const patch_method_signature_t *sig_info) {
+    (void) this;
+    (void) args;
+    (void) sig_info;
+    /* GroupLookup 在 FindBestTransfers 的内层循环里被反复读取，
+     * 检查过一次（本次 resize 周期内）就短路，避免热路径上反复走
+     * field_get_value / array_length 的托管往返。 */
+    if (g_emergency_group_lookup_checked)
+        return;
+    if (!result || !patchlib_is_valid(f_emergency_group_lookup))
+        return;
+
+    patch_handle_t array = *(patch_handle_t *) result;
+    if (!patchlib_is_valid(array))
+        return;
+
+    const int need = terraria_item_manager_get_count();
+    const size_t len = patchlib_array_length(array);
+    if (len >= (size_t) need) {
+        g_emergency_group_lookup_checked = true;
+        return;
+    }
+
+    patch_handle_t default_group = PATCH_NULL;
+    if (patchlib_is_valid(f_emergency_group_default))
+        patchlib_field_get_value(f_emergency_group_default, PATCH_NULL,
+                                 &default_group);
+
+    /* 兜底：Group.Default 拿不到时复用旧表最后一个非 null 项，
+     * 保证新槽位不是 null（否则 obj.DistanceStepSize 会 NRE）。 */
+    if (!patchlib_is_valid(default_group)) {
+        for (size_t i = len; i-- > 0;) {
+            patch_handle_t candidate = PATCH_NULL;
+            if (patchlib_array_at(array, i, &candidate) &&
+                patchlib_is_valid(candidate)) {
+                default_group = candidate;
+                break;
+            }
+            if (patchlib_is_valid(candidate))
+                patchlib_free(candidate);
+        }
+    }
+    if (!patchlib_is_valid(default_group)) {
+        TEKLOG_WARN("emergency stacking: no default group available, "
+                    "skip growing GroupLookup (len=%zu need=%d)", len, need);
+        return;
+    }
+
+    patch_handle_t bigger = patchlib_array_resize(array, (size_t) need, NULL);
+    if (!patchlib_is_valid(bigger)) {
+        TEKLOG_WARN("emergency stacking: GroupLookup grow failed "
+                    "(len=%zu need=%d)", len, need);
+        patchlib_free(default_group);
+        return;
+    }
+
+    for (size_t i = len; i < (size_t) need; ++i)
+        patchlib_array_set(bigger, i, &default_group);
+    patchlib_free(default_group);
+
+    /* 写回字段，后续 getter 直接返回长数组，不再重复扩容 */
+    patchlib_field_set_value(f_emergency_group_lookup, PATCH_NULL, &bigger);
+    /* 返回值交给游戏/loader 读取，句柄不释放 */
+    *(patch_handle_t *) result = bigger;
+    g_emergency_group_lookup_checked = true;
+    TEKLOG_INFO("emergency stacking: GroupLookup %zu -> %d (default group)",
+                len, need);
+}
+
+/* ItemFilters.MiscFallback..ctor postfix：
+ *   bool? flag = _fitsFilterByItemType[entry.type];   (ItemFilters.cs:419)
+ * 创意菜单「杂项」页签按物品 type 查缓存，无边界检查。新槽是
+ * Nullable<bool> 的默认值（HasValue == false），首次访问时重新计算。 */
+static void misc_fallback_ctor_postfix(patch_handle_t this, void **args,
+                                       void *result,
+                                       const patch_method_signature_t *sig_info) {
+    (void) args;
+    (void) result;
+    (void) sig_info;
+    if (!patchlib_is_valid(this))
+        return;
+    grow_instance_array_field(f_misc_fallback_fits, this,
+                              terraria_item_manager_get_count(),
+                              "ItemFilters.MiscFallback._fitsFilterByItemType");
+}
+
+/* LootSimulationItemCounter..ctor postfix：
+ *   _itemCountsObtained[itemId] += amount;   (LootSimulationItemCounter.cs:21/25)
+ * 只有掉落模拟（开发/测试功能）会用到，但同样按物品 id 直接索引。 */
+static void loot_simulation_item_counter_ctor_postfix(
+        patch_handle_t this, void **args, void *result,
+        const patch_method_signature_t *sig_info) {
+    (void) args;
+    (void) result;
+    (void) sig_info;
+    if (!patchlib_is_valid(this))
+        return;
+    const int need = terraria_item_manager_get_count();
+    grow_instance_array_field(f_loot_counter_counts, this, need,
+                              "LootSimulationItemCounter._itemCountsObtained");
+    grow_instance_array_field(f_loot_counter_counts_expert, this, need,
+                              "LootSimulationItemCounter._itemCountsObtainedExpert");
+}
+
+/* 安装上述实例数组的自愈钩子。句柄长期缓存，class 句柄不释放。 */
+static void install_instance_item_array_hooks(void) {
+    /* EmergencyStacking._groupLookup / EmergencyStacking+Group.Default */
+    {
+        patch_handle_t cls = patchlib_type_get_type("Terraria.GameContent",
+                                                    "EmergencyStacking");
+        if (patchlib_is_valid(cls)) {
+            g_emergency_stacking_class = cls;
+            f_emergency_group_lookup =
+                    patchlib_type_get_field(cls, "_groupLookup");
+
+            patch_handle_t group = patchlib_type_get_inner_type(cls, "Group");
+            if (patchlib_is_valid(group)) {
+                f_emergency_group_default =
+                        patchlib_type_get_field(group, "Default");
+                patchlib_free(group);
+            }
+
+            patch_handle_t getter = patchlib_type_get_method_by_param_count(
+                    cls, "get_GroupLookup", 0);
+            if (patchlib_is_valid(getter)) {
+                if (patchlib_install_prepost_hook(
+                            getter, NULL,
+                            emergency_stacking_group_lookup_postfix) ==
+                    PATCH_HOOK_INVALID_ID)
+                    TEKLOG_WARN("emergency stacking: hook install failed");
+                patchlib_free(getter);
+            } else {
+                TEKLOG_WARN("emergency stacking: get_GroupLookup not found");
+            }
+        } else {
+            TEKLOG_DEBUG("emergency stacking: type not found");
+        }
+    }
+
+    /* ItemFilters+MiscFallback._fitsFilterByItemType */
+    {
+        patch_handle_t filters = patchlib_type_get_type(
+                "Terraria.GameContent.Creative", "ItemFilters");
+        if (patchlib_is_valid(filters)) {
+            patch_handle_t misc =
+                    patchlib_type_get_inner_type(filters, "MiscFallback");
+            patchlib_free(filters);
+            if (patchlib_is_valid(misc)) {
+                g_misc_fallback_class = misc;
+                f_misc_fallback_fits = patchlib_type_get_field(
+                        misc, "_fitsFilterByItemType");
+                patch_handle_t ctor =
+                        patchlib_type_get_method_by_param_count(misc, ".ctor", 1);
+                if (patchlib_is_valid(ctor)) {
+                    if (patchlib_install_prepost_hook(
+                                ctor, NULL, misc_fallback_ctor_postfix) ==
+                        PATCH_HOOK_INVALID_ID)
+                        TEKLOG_WARN("creative filters: hook install failed");
+                    patchlib_free(ctor);
+                } else {
+                    TEKLOG_WARN("creative filters: MiscFallback ctor not found");
+                }
+            } else {
+                TEKLOG_DEBUG("creative filters: MiscFallback not found");
+            }
+        } else {
+            TEKLOG_DEBUG("creative filters: ItemFilters not found");
+        }
+    }
+
+    /* LootSimulationItemCounter._itemCountsObtained(_Expert) */
+    {
+        patch_handle_t cls = patchlib_type_get_type(
+                "Terraria.GameContent.LootSimulation",
+                "LootSimulationItemCounter");
+        if (patchlib_is_valid(cls)) {
+            g_loot_counter_class = cls;
+            f_loot_counter_counts =
+                    patchlib_type_get_field(cls, "_itemCountsObtained");
+            f_loot_counter_counts_expert =
+                    patchlib_type_get_field(cls, "_itemCountsObtainedExpert");
+            patch_handle_t ctor =
+                    patchlib_type_get_method_by_param_count(cls, ".ctor", 0);
+            if (patchlib_is_valid(ctor)) {
+                if (patchlib_install_prepost_hook(
+                            ctor, NULL,
+                            loot_simulation_item_counter_ctor_postfix) ==
+                    PATCH_HOOK_INVALID_ID)
+                    TEKLOG_WARN("loot simulation: hook install failed");
+                patchlib_free(ctor);
+            } else {
+                TEKLOG_WARN("loot simulation: LootSimulationItemCounter ctor "
+                            "not found");
+            }
+        } else {
+            TEKLOG_DEBUG("loot simulation: LootSimulationItemCounter not found");
+        }
+    }
+}
+
 void terraria_item_manager_resize(const bool allow_create) {
     const int new_size = terraria_item_manager_get_count();
+
+    /* 允许下一次访问 EmergencyStacking.GroupLookup 时重新校验长度 */
+    g_emergency_group_lookup_checked = false;
 
     patch_handle_t bool_type = patchlib_get_basic_type(PATCH_BOOL);
     patch_handle_t int_type = patchlib_get_basic_type(PATCH_INT32);
