@@ -7,8 +7,11 @@
  * 设计要点：
  *   · ID：base = ProjectileID.Count（原版数量），runtime_id = base + 注册表下标；
  *     注册表按 (loader, mod, name) 排序后分配，保证客户端/服务端一致。
- *   · 扩容：TextureAssets.Projectile[] 与 ProjectileID.Sets.*（按 type 索引的静态数组）
- *     必须一起扩容，否则绘制/逻辑越界。
+ *   · 扩容：所有「长度 == ProjectileID.Count、按弹幕 type 索引」的静态表都要扩：
+ *     TextureAssets.Projectile[]、ProjectileID.Sets.*、Main.projFrames/projPet/
+ *     projHook/projHostile、Player.ownedProjectileCounts[]。
+ *     唯一例外是 Projectile.perIDStaticNPCImmunity（uint[Count, MaxNPCs]）：
+ *     patchlib 没有扩二维数组第一维的能力，见其处理函数的注释。
  *   · SetDefaults：postfix，给自定义类型的实例套用 Mod 默认值。
  *   · AI：**prefix**（void 方法，桌面加载器不会读返回缓冲），只对自定义类型接管，
  *     返回 true 跳过原版 AI；其余类型立即返回 false 走原版。
@@ -75,6 +78,11 @@ static float g_move_vy = 0.0f;
 static patch_handle_t f_main_players = PATCH_NULL;  // Main.player (Player[])
 static patch_handle_t f_owned_counts = PATCH_NULL;  // Player.ownedProjectileCounts (int[])
 static patch_handle_t f_proj_frames = PATCH_NULL;   // Main.projFrames (int[])
+
+/* Projectile.perIDStaticNPCImmunity 是按 type 索引的二维表，见
+ * clamp_static_immunity_identity()。 */
+static patch_handle_t f_uses_id_static = PATCH_NULL;      // usesIDStaticNPCImmunity (bool)
+static patch_handle_t f_immunity_identity = PATCH_NULL;   // immunityIdentity (int)
 
 static void ensure_player_owned_counts(const int new_size) {
     if (!patchlib_is_valid(f_main_players) || !patchlib_is_valid(f_owned_counts))
@@ -306,9 +314,13 @@ static void fill_new_slots_with_modal(patch_handle_t old_array,
             break;
 }
 
-/* 把某个"按 ProjectileID 索引"的静态数组扩到 new_size（长度必须等于 base 才动） */
+/* 把某个"按 ProjectileID 索引"的静态数组扩到 new_size（长度必须等于 base 才动）。
+ * modal = 用原数组众数填充新槽（ProjectileID.Sets 的默认值大多不是 0）；
+ * fill_with_int = 用固定 int 填充新槽（Main.projFrames 必须 >= 1）。 */
 static void resize_static_array(patch_handle_t field, const char *name,
-                                const int base, const int new_size) {
+                                const int base, const int new_size,
+                                const bool modal, const int int_fill,
+                                const bool fill_with_int) {
     if (!patchlib_is_valid(field)) {
         TEKLOG_WARN("projectile resize: field %s not found", name ? name : "?");
         return;
@@ -326,9 +338,16 @@ static void resize_static_array(patch_handle_t field, const char *name,
         patchlib_free(array);
         return;
     }
-    patch_handle_t bigger = patchlib_array_resize(array, (size_t) new_size, NULL);
+    patch_handle_t bigger = PATCH_NULL;
+    if (fill_with_int) {
+        int fill = int_fill;
+        bigger = patchlib_array_resize(array, (size_t) new_size, &fill);
+    } else {
+        bigger = patchlib_array_resize(array, (size_t) new_size, NULL);
+    }
     if (patchlib_is_valid(bigger)) {
-        fill_new_slots_with_modal(array, bigger, len, (size_t) new_size);
+        if (modal)
+            fill_new_slots_with_modal(array, bigger, len, (size_t) new_size);
         patchlib_field_set_value(field, NULL, &bigger);
         TEKLOG_INFO("projectile resize: %s %zu -> %d", name ? name : "?", len,
                     new_size);
@@ -348,9 +367,13 @@ void terraria_projectile_manager_resize() {
         return;
     const int new_size = base + (int) custom;
 
-    /* 1) TextureAssets.Projectile[] */
+    /* 1) TextureAssets.Projectile[]
+     *    引用数组不做众数填充：array_at 取到的是借用句柄（每个元素一个新
+     *    GCHandle），跨到 resize 里既不会命中同一个 key，也不会被释放；
+     *    新槽留 null，稍后 init_texture2d() 会写入扩展贴图/占位图。
+     *    （与 npc_manager 对 TextureAssets.Npc 的处理一致。） */
     resize_static_array(f_texture_projectile, "TextureAssets.Projectile", base,
-                        new_size);
+                        new_size, false, 0, false);
 
     /* 2) ProjectileID.Sets.* */
     patch_handle_t id_cls = patchlib_type_get_type("Terraria.ID", "ProjectileID");
@@ -429,7 +452,12 @@ void terraria_projectile_manager_resize() {
 
     /* 3) Main 上按弹幕 type 索引的静态表
      *    Projectile.Draw 会直接读 Main.projPet[type] / Main.projFrames[type]，
-     *    Item.CheckItemUse 会读 Main.projHook[shoot]，不扩容会越界。 */
+     *    Item.CheckItemUse 会读 Main.projHook[shoot]，不扩容会越界。
+     *
+     *    projFrames 必须显式填 1：扩容发生在 Main.Initialize 的 prefix，此时
+     *    Initialize_TileAndNPCData1 还没把原版槽位刷成 1（数组全是 0），
+     *    众数填充会把新槽填成 0；而绘制里是 Height / projFrames[type]，
+     *    0 会直接 DivideByZeroException。 */
     static const char *main_fields[] = {
             "projFrames", "projPet", "projHook", "projHostile"};
     for (size_t i = 0; i < sizeof(main_fields) / sizeof(main_fields[0]); ++i) {
@@ -438,7 +466,12 @@ void terraria_projectile_manager_resize() {
             continue;
         if (i == 0 && !patchlib_is_valid(f_proj_frames))
             f_proj_frames = field;   /* 保留句柄给帧图写入用 */
-        resize_static_array(field, main_fields[i], base, new_size);
+        if (i == 0)
+            resize_static_array(field, main_fields[i], base, new_size, false, 1,
+                                true);
+        else
+            resize_static_array(field, main_fields[i], base, new_size, true, 0,
+                                false);
         if (!(i == 0 && patchlib_is_valid(f_proj_frames) && f_proj_frames == field))
             patchlib_free(field);
     }
@@ -632,6 +665,52 @@ static void ensure_projectile_ai_arrays(patch_handle_t inst) {
     }
 }
 
+/**
+ * perIDStaticNPCImmunity 是 `uint[ProjectileID.Count, InitData.MaxNPCs]`，
+ * 第一维按弹幕 type 索引（Projectile.SetDefaults 里 immunityIdentity = type，
+ * Damage_PVE / Damage_PVE_Inner 用 immunityIdentity 取行）。
+ *
+ * patchlib_array_resize 只能扩一维数组：桌面端的 il2cpp_array_resize 对多维数组
+ * 只会加长**最后一维**（tefloader/net/Il2CppApi/Array.cs 的 Rank > 1 分支），
+ * Android 端也没有「按维度扩容」的入口，所以这张表没法像其它表一样补齐。
+ *
+ * 如果扩展打开了 usesIDStaticNPCImmunity，自定义 type 一命中就会用越界下标取行
+ * → IndexOutOfRangeException（伤害结算中断）。这里做退化处理：把自定义 type 的
+ * 身份收回 0 号行。原版 type 0（None）永远不会产生弹幕，该行在游戏里是空的，
+ * 所以不会污染原版弹幕；同一自定义 type 的多个实例仍然共享静态免疫（与原语义
+ * 一致），代价只是不同自定义 type 之间不再分组。
+ *
+ * TODO: patchlib 支持二维数组第一维扩容后删掉本函数，改为真正扩容。
+ */
+static void clamp_static_immunity_identity(patch_handle_t inst) {
+    if (!inst || !patchlib_is_valid(f_immunity_identity) ||
+        !patchlib_is_valid(f_uses_id_static))
+        return;
+
+    /* 绝大多数弹幕没开这个标记，先读它，避免每次 Damage 都多读几个字段 */
+    bool uses_static = false;
+    patchlib_field_get_value(f_uses_id_static, inst, &uses_static);
+    if (!uses_static)
+        return;
+
+    int identity = 0;
+    patchlib_field_get_value(f_immunity_identity, inst, &identity);
+    const int base = terraria_projectile_id_get_count();
+    /* 原版弹幕（identity == type < base）或扩展显式指定了原版分组：不动 */
+    if (base <= 0 || (identity >= 0 && identity < base))
+        return;
+
+    static bool logged = false;
+    const int fallback = 0;
+    patchlib_field_set_value(f_immunity_identity, inst, (void *) &fallback);
+    if (!logged) {
+        logged = true;
+        TEKLOG_DEBUG("projectile: perIDStaticNPCImmunity 无法扩二维，"
+                     "immunityIdentity %d -> 0（自定义弹幕共享 0 号行）",
+                     identity);
+    }
+}
+
 static void set_defaults_postfix(patch_handle_t this, void **args, void *result,
                                  const patch_method_signature_t *sig_info) {
     (void) result;
@@ -663,19 +742,21 @@ static void set_defaults_postfix(patch_handle_t this, void **args, void *result,
     /* ai / localAI 若为空，原版 AI 一进来就会空指针，这里提前补好 */
     ensure_projectile_ai_arrays(this);
 
-    /* 帧图：声明了帧数就把 Main.projFrames[type] 写上（0 = 单帧整图不写）。
-     * projFrames 是 int[] 静态数组：先取数组对象，再写第 type 个元素。 */
+    /* 帧图：Main.projFrames[type] 必须 >= 1（绘制里是 Height / projFrames[type]）。
+     * 声明了帧数就按声明写，否则写 1 = 单帧整图。 */
     {
         terraria_projectile_handle_t **fp =
                 tefstd_vector_at(&g_terraria_projectile_registry, (size_t) nid);
-        if (fp && *fp && (*fp)->frames > 0 && patchlib_is_valid(f_proj_frames)) {
+        if (fp && *fp && patchlib_is_valid(f_proj_frames)) {
             patch_handle_t arr = PATCH_NULL;
             patchlib_field_get_value(f_proj_frames, NULL, &arr);
             if (patchlib_is_valid(arr) &&
                 (size_t) type < patchlib_array_length(arr)) {
-                int frames = (*fp)->frames;
+                int frames = (*fp)->frames > 0 ? (*fp)->frames : 1;
                 patchlib_array_set(arr, (size_t) type, &frames);
             }
+            if (patchlib_is_valid(arr))
+                patchlib_free(arr);
         }
     }
 
@@ -687,6 +768,10 @@ static void set_defaults_postfix(patch_handle_t this, void **args, void *result,
             tefstd_vector_at(&g_terraria_projectile_registry, (size_t) nid);
     if (pp && *pp && (*pp)->projectile_ops.set_defaults)
         (*pp)->projectile_ops.set_defaults(*pp, this);
+
+    /* 扩展可能在 set_defaults 里打开 usesIDStaticNPCImmunity / 改写
+     * immunityIdentity，这里（回调之后）再兜一次（见函数注释）。 */
+    clamp_static_immunity_identity(this);
 
 }
 
@@ -773,6 +858,9 @@ static bool damage_prefix(patch_handle_t this, void **args,
     (void) args;
     (void) sig_info;
     (void) result;
+    /* 自定义 type 若开了 ID 静态免疫，原版 Damage 会用 type 索引
+     * perIDStaticNPCImmunity 第一维（无法扩容），先收回安全行。 */
+    clamp_static_immunity_identity(this);
     if (g_damage_depth < TEF_MAX_DAMAGE_DEPTH) {
         /* this 只在本次 hook 回调内有效，先持久化再跨回调使用 */
         g_damage_stack[g_damage_depth] = TEF_PROJ_HANDLE_PERSIST(this);
@@ -921,6 +1009,13 @@ void terraria_projectile_manager_init() {
 
     f_type = patchlib_type_get_field(projectile_class, "type");
     f_active = patchlib_type_get_field(projectile_class, "active");
+
+    /* perIDStaticNPCImmunity 的兜底（二维表无法扩容，见
+     * clamp_static_immunity_identity） */
+    f_uses_id_static =
+            patchlib_type_get_field(projectile_class, "usesIDStaticNPCImmunity");
+    f_immunity_identity =
+            patchlib_type_get_field(projectile_class, "immunityIdentity");
 
     /* 玩家侧缓存字段（见 ensure_player_owned_counts） */
     patch_handle_t main_cls = patchlib_type_get_type("Terraria", "Main");
