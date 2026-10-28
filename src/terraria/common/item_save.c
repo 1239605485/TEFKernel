@@ -26,9 +26,11 @@
  * 所以背包里的 Mod 物品退出重进就没了。这里把自定义物品按稳定字符串键
  * (loader/mod/name) 另存到“伴生文件”，读档后按槽位塞回去；数字 ID 变化也不影响。
  *
- * 自定义 Buff 也写进玩家伴生文件：原版存档按数字 ID 存 buff，卸载 Mod 后
- * 残留的 401+ ID 会让 Main.buffNoSave[id] 越界；所以自定义 Buff 一律
- * Main.buffNoSave = true（原版不存），改由这里按稳定字符串键存读。
+ * 自定义 Buff 也写进玩家伴生文件：自定义 Buff 由内核自管理，runtime_id 不会
+ * 写进 player.buffType（原版存档与绘制路径只会看到 0..BuffID.Count-1，因此
+ * Main.buffNoSave / Player.buffImmune / TextureAssets.Buff / Lang 缓存等按
+ * buff id 定长的原版数组不需要、也不应该为自定义 Buff 扩容），所以这里按稳定
+ * 字符串键 (loader/mod/name) 存读；卸载 Mod 后存档里不会残留无效 ID。
  *
  * 文件位置与命名：
  *   - 玩家：<xxx.plr>.tef  （与玩家存档同目录，随其一起备份/迁移）
