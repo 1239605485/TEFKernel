@@ -67,14 +67,16 @@ static const char *unknown_item_text(language_culture_t l) {
             "}";
 }
 
-static void unknown_item_recipe() {
-    terraria_recipe_set_result(unknown_item.runtime_id, 9999);
-    terraria_recipe_set_material((int[2]){9, 1}, 1);
-    terraria_recipe_add();
-}
+// UNKNOWN 占位物不再加合成配方（会出现在合成表里，还可以用 1 个木材刷 9999 个）
+// static void unknown_item_recipe() {
+//     terraria_recipe_set_result(unknown_item.runtime_id, 9999);
+//     terraria_recipe_set_material((int[2]){9, 1}, 1);
+//     terraria_recipe_add();
+// }
 
 static void unknown_item_early_init(terraria_item_handle_t *current) {
-    terraria_recipe_manager_register_callback(unknown_item_recipe);
+    (void) current;
+    // terraria_recipe_manager_register_callback(unknown_item_recipe);
     terraria_language_manager_register_callback(unknown_item_text);
 }
 

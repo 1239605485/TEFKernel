@@ -247,6 +247,100 @@ static void container_set_custom(patch_handle_t arr, size_t slot, bool is_chest,
   }
 }
 
+/* 把箱子里“超出当前已注册自定义范围”的物品换成内核占位物品。
+ * 这些物品通常来自已卸载的 Mod（或 .tef 伴生文件缺失/滞后）。
+ * 不清理的话，UI / 绘制按 type 索引原版数组会越界，表现为箱子打不开。 */
+static int sanitize_chest(patch_handle_t chest, const int max_valid) {
+  if (!patchlib_is_valid(chest) || !patchlib_is_valid(f_chest_item) ||
+      !patchlib_is_valid(g_ops.f_type))
+    return 0;
+
+  terraria_item_handle_t *placeholder = terraria_item_manager_unknown_item();
+  const int placeholder_id = placeholder ? placeholder->runtime_id : -1;
+  if (placeholder_id < 0)
+    return 0;
+
+  int max_items = 0;
+  if (patchlib_is_valid(f_chest_max_items))
+    patchlib_field_get_value(f_chest_max_items, chest, &max_items);
+
+  patch_handle_t items = PATCH_NULL;
+  patchlib_field_get_value(f_chest_item, chest, &items);
+  if (!patchlib_is_valid(items))
+    return 0;
+
+  size_t lim = patchlib_array_length(items);
+  if (max_items > 0 && (size_t)max_items < lim)
+    lim = (size_t)max_items;
+
+  int changed = 0;
+  for (size_t si = 0; si < lim; ++si) {
+    patch_handle_t item = container_get_item(items, si, true);
+    if (!patchlib_is_valid(item))
+      continue;
+
+    int type = 0;
+    patchlib_field_get_value(g_ops.f_type, item, &type);
+    if (type >= max_valid) {
+      container_set_custom(items, si, true, placeholder_id, 1, 0);
+      changed++;
+    }
+    patchlib_free(item);
+  }
+
+  patchlib_free(items);
+  return changed;
+}
+
+static void sanitize_world_chests(void) {
+  if (!patchlib_is_valid(f_main_chest))
+    return;
+
+  patch_handle_t chests = PATCH_NULL;
+  patchlib_field_get_value(f_main_chest, PATCH_NULL, &chests);
+  if (!patchlib_is_valid(chests))
+    return;
+
+  const int max_valid = terraria_item_manager_get_count();
+  int changed = 0;
+  const size_t count = patchlib_array_length(chests);
+  for (size_t i = 0; i < count; ++i) {
+    patch_handle_t chest = PATCH_NULL;
+    if (!patchlib_array_at(chests, i, &chest) || !patchlib_is_valid(chest))
+      continue;
+    changed += sanitize_chest(chest, max_valid);
+    patchlib_free(chest);
+  }
+  patchlib_free(chests);
+
+  if (changed > 0)
+    TEKLOG_INFO("item_save: replaced %d stale custom item(s) in world chests",
+                changed);
+}
+
+static void sanitize_player_banks(patch_handle_t player) {
+  if (!patchlib_is_valid(player))
+    return;
+
+  patch_handle_t banks[4] = {f_player_bank, f_player_bank2, f_player_bank3,
+                             f_player_bank4};
+  const int max_valid = terraria_item_manager_get_count();
+  int changed = 0;
+  for (int i = 0; i < 4; ++i) {
+    if (!patchlib_is_valid(banks[i]))
+      continue;
+    patch_handle_t chest = PATCH_NULL;
+    patchlib_field_get_value(banks[i], player, &chest);
+    if (!patchlib_is_valid(chest))
+      continue;
+    changed += sanitize_chest(chest, max_valid);
+    patchlib_free(chest);
+  }
+
+  if (changed > 0)
+    TEKLOG_INFO("item_save: replaced %d stale custom item(s) in banks", changed);
+}
+
 // 当某个槽位里的物品是“自定义物品”时，把它的稳定键写出一行；返回是否写出。
 static bool write_custom_item_line(FILE *f, const size_t a, const size_t b,
                                    patch_handle_t item) {
@@ -500,6 +594,7 @@ static void player_load_postfix(patch_handle_t this, void **args, void *result,
   patch_handle_t player = PATCH_NULL;
   patchlib_method_invoke_args(m_pfd_get_player, pfd, &player, NULL);
   load_player_items(player, pfd);
+  sanitize_player_banks(player);
 }
 
 // ------------------------------------------------------------------
@@ -673,6 +768,7 @@ static void chest_load_postfix(patch_handle_t this, void **args, void *result,
   (void)result;
   (void)sig;
   load_world_chests();
+  sanitize_world_chests();
 }
 
 // ------------------------------------------------------------------
