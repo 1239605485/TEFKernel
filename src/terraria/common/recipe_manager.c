@@ -65,6 +65,7 @@ static patch_handle_t m_get_available_recipe = PATCH_NULL;
 static patch_handle_t m_set_available_recipe = PATCH_NULL;
 static patch_handle_t m_get_focus_recipe = PATCH_NULL;
 static patch_handle_t m_get_local_player = PATCH_NULL;
+static patch_handle_t m_get_in_guide_menu = PATCH_NULL;
 static patch_handle_t m_collect_items = PATCH_NULL;
 static patch_handle_t m_meets_tile = PATCH_NULL;
 static patch_handle_t m_meets_env = PATCH_NULL;
@@ -88,6 +89,7 @@ static void ensure_recipe_capacity(void);
 
 #if !defined(__ANDROID__)
 static void resize_crafting_ui_recipe_y(const int new_size);
+static void resize_new_crafting_ui_lookup(const int new_size);
 #endif
 
 static bool recipe_add_prefix(patch_handle_t this, void **args,
@@ -168,6 +170,14 @@ static bool find_recipes_prefix(patch_handle_t this, void **args,
 
     const bool can_delay = (args && args[0]) ? *(bool *) args[0] : true;
     if (can_delay) return false;   /* 原版只是标记延迟，等它真正扫描时再补 */
+
+    /* 向导「材料→可合成」模式走的是 CollectGuideRecipes，原版只扫前 3700 条；
+     * 这里不能再把普通可合成配方追加进去，否则向导列表会混入无关配方。 */
+    if (patchlib_is_valid(m_get_in_guide_menu)) {
+        bool in_guide = false;
+        patchlib_method_invoke_args(m_get_in_guide_menu, PATCH_NULL, &in_guide, NULL);
+        if (in_guide) return false;
+    }
 
     int total = 0;
     if (patchlib_is_valid(num_recipes_f))
@@ -333,6 +343,12 @@ void terraria_recipe_manager_init() {
                 patchlib_property_get_get_method(local_player_prop);
         patchlib_free(local_player_prop);
     }
+    patch_handle_t guide_prop =
+            patchlib_type_get_property(main_cls, "InGuideCraftMenu");
+    if (patchlib_is_valid(guide_prop)) {
+        m_get_in_guide_menu = patchlib_property_get_get_method(guide_prop);
+        patchlib_free(guide_prop);
+    }
 
     m_collect_items = patchlib_type_get_method(recipe_cls,
                                                "CollectItemsToCraftWithFrom");
@@ -472,7 +488,26 @@ static void ensure_recipe_capacity(void) {
     if (!patchlib_is_valid(recipe_array)) return;
 
     const int max_recipes = (int) patchlib_array_length(recipe_array);
-    if (max_recipes <= 0 || num_recipes < max_recipes) return;
+    if (max_recipes <= 0) return;
+
+#if !defined(__ANDROID__)
+    /* 别的扩展可能把 Main.recipe 加长了却没动 Recipe.maxRecipes；
+     * 这里同步一次，避免原版/UI 仍按旧上限遍历。 */
+    if (patchlib_is_valid(max_recipes_f)) {
+        int configured = 0;
+        patchlib_field_get_value(max_recipes_f, PATCH_NULL, &configured);
+        if (configured < max_recipes) {
+            int synced = max_recipes;
+            patchlib_field_set_value(max_recipes_f, PATCH_NULL, &synced);
+            resize_crafting_ui_recipe_y(synced);
+            resize_new_crafting_ui_lookup(synced);
+            TEKLOG_INFO("recipe: maxRecipes %d -> %d（同步数组长度）", configured,
+                        synced);
+        }
+    }
+#endif
+
+    if (num_recipes < max_recipes) return;
 
     int resize_recipes = max_recipes + 4096;
 
@@ -527,6 +562,7 @@ static void ensure_recipe_capacity(void) {
 #else
     patchlib_field_set_value(max_recipes_f, PATCH_NULL, &resize_recipes);
     resize_crafting_ui_recipe_y(resize_recipes);
+    resize_new_crafting_ui_lookup(resize_recipes);
     if (patchlib_is_valid(new_available_recipe_array))
         patchlib_field_set_value(available_recipe_f, PATCH_NULL,
                                  &new_available_recipe_array);
@@ -581,6 +617,60 @@ static void resize_crafting_ui_recipe_y(const int new_size) {
         }
     }
     patchlib_free(arr);
+}
+
+/* 桌面端「高级合成网格」NewCraftingUI 里还有一份按配方下标索引的表：
+ *     private RecipeEntry[] _recipeListLookup;   // Array.Resize(.., Recipe.maxRecipes)
+ * 它只在 ResetRecipes()（打开面板 / 切过滤器 / RefreshGrid）时按当时的
+ * maxRecipes 重建，而 UpdateContents() 每帧用
+ *     int num = Main.availableRecipe[i];  ...  _recipeListLookup[num]
+ * 去索引（num 是配方下标，不是可选项下标）。运行期新增配方把上限抬高后，
+ * 若网格已经打开过，这张表还停在旧长度，索引 [旧上限, numRecipes) 会
+ * IndexOutOfRange，异常被 Main.ignoreErrors 吞掉，表现为合成网格空白/缺项。
+ * 新槽保持 null，与 ResetRecipes() 里的 Array.Clear 等价。 */
+static void resize_new_crafting_ui_lookup(const int new_size) {
+    static patch_handle_t instance_f = PATCH_NULL;
+    static patch_handle_t lookup_f = PATCH_NULL;
+    static bool resolved = false;
+
+    if (!resolved) {
+        resolved = true;
+        patch_handle_t cls =
+                patchlib_type_get_type("Terraria.GameContent.UI", "NewCraftingUI");
+        if (patchlib_is_valid(cls)) {
+            instance_f = patchlib_type_get_field(cls, "_instance");
+            lookup_f = patchlib_type_get_field(cls, "_recipeListLookup");
+            patchlib_free(cls);
+        }
+    }
+    if (!patchlib_is_valid(instance_f) || !patchlib_is_valid(lookup_f)) return;
+
+    /* 面板从未打开过时 _instance 还是 null；等它第一次 Open 时
+     * ResetRecipes() 会按新的 maxRecipes 建表，这里不用管。 */
+    patch_handle_t instance = PATCH_NULL;
+    patchlib_field_get_value(instance_f, PATCH_NULL, &instance);
+    if (!patchlib_is_valid(instance)) return;
+
+    patch_handle_t arr = PATCH_NULL;
+    patchlib_field_get_value(lookup_f, instance, &arr);
+    if (patchlib_is_valid(arr)) {
+        const size_t len = patchlib_array_length(arr);
+        if (len < (size_t) new_size) {
+            patch_handle_t bigger =
+                    patchlib_array_resize(arr, (size_t) new_size, NULL);
+            if (patchlib_is_valid(bigger)) {
+                patchlib_field_set_value(lookup_f, instance, &bigger);
+                TEKLOG_DEBUG("recipe: NewCraftingUI._recipeListLookup %zu -> %d",
+                             len, new_size);
+                patchlib_free(bigger);
+            } else {
+                TEKLOG_ERROR(
+                    "recipe: NewCraftingUI._recipeListLookup resize failed");
+            }
+        }
+        patchlib_free(arr);
+    }
+    patchlib_free(instance);
 }
 #endif
 
