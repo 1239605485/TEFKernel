@@ -586,6 +586,47 @@ static void resize_scene_metrics(const int base, const int new_size) {
     TEKLOG_INFO("npc resize: SceneMetrics.ClosestNPCPosition %d instance(s)", done);
 }
 
+/* TownRoomManager._hasRoom 是实例字段、按 NPC type 索引；
+ * 除了 .ctor 钩子覆盖的实例外，WorldGen.TownManager 是静态字段，
+ * Mod 加载前就已经 new 好（Terraria/WorldGen.cs:4037），钩子管不到它。
+ * WorldGen 里存在 for (j < NPCID.Count) { TownManager.HasRoomQuick(j); }
+ * 的循环，桌面端 NPCID.Count 抬高后会直接越界。这里补扩现存实例；
+ * 之后 WorldGen.ClearWorld（:6900）重建的实例仍由 .ctor 钩子处理。 */
+static void resize_town_room_instance(const int base, const int new_size) {
+    if (!patchlib_is_valid(f_has_room))
+        return;
+    patch_handle_t wg_cls = patchlib_type_get_type("Terraria", "WorldGen");
+    if (!patchlib_is_valid(wg_cls))
+        return;
+    patch_handle_t f_tm = patchlib_type_get_field(wg_cls, "TownManager");
+    patchlib_free(wg_cls);
+    if (!patchlib_is_valid(f_tm))
+        return;
+
+    patch_handle_t tm = PATCH_NULL;
+    patchlib_field_get_value(f_tm, NULL, &tm);
+    patchlib_free(f_tm);
+    if (!patchlib_is_valid(tm))
+        return;
+
+    patch_handle_t arr = PATCH_NULL;
+    patchlib_field_get_value(f_has_room, tm, &arr);
+    if (patchlib_is_valid(arr) && patchlib_array_length(arr) == (size_t) base) {
+        patch_handle_t bigger =
+                patchlib_array_resize(arr, (size_t) new_size, NULL);
+        if (patchlib_is_valid(bigger)) {
+            patchlib_field_set_value(f_has_room, tm, &bigger);
+            patchlib_free(bigger);
+            TEKLOG_INFO("npc resize: WorldGen.TownManager._hasRoom -> %d",
+                        new_size);
+        } else {
+            TEKLOG_ERROR("npc resize: WorldGen.TownManager._hasRoom failed");
+        }
+    }
+    if (patchlib_is_valid(arr)) patchlib_free(arr);
+    patchlib_free(tm);
+}
+
 void terraria_npc_manager_resize(void) {
     const size_t custom = tefstd_vector_size(&g_terraria_npc_registry);
     if (custom == 0)
@@ -642,6 +683,9 @@ void terraria_npc_manager_resize(void) {
 
     /* 7) SceneMetrics.ClosestNPCPosition */
     resize_scene_metrics(base, new_size);
+
+    /* 8) WorldGen.TownManager._hasRoom（.ctor 钩子覆盖不到的既有实例） */
+    resize_town_room_instance(base, new_size);
 
 #if !defined(__ANDROID__)
     /* Main.DrawNPCs 的循环条件是 type < NPCID.Count；桌面端 Count 是
